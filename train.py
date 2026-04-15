@@ -55,6 +55,14 @@ except ImportError:
     TENSORBOARD_FOUND = False
     print("not found tf board")
 
+# 尝试导入 matplotlib 用于绘制曲线
+try:
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_FOUND = True
+except ImportError:
+    MATPLOTLIB_FOUND = False
+    print("matplotlib not found, will skip plotting PSNR curve.")
+
 def saveRuntimeCode(dst: str) -> None:
     additionalIgnorePatterns = ['.git', '.gitignore']
     ignorePatterns = set()
@@ -78,13 +86,30 @@ def saveRuntimeCode(dst: str) -> None:
     
     print('Backup Finished!')
 
+def plot_psnr_curve(iterations, psnrs, save_path):
+    """绘制 PSNR 随迭代次数的变化曲线并保存"""
+    if not MATPLOTLIB_FOUND:
+        print("matplotlib not available, skip plotting.")
+        return
+    plt.figure(figsize=(10, 6))
+    plt.plot(iterations, psnrs, marker='o', linestyle='-', color='b')
+    plt.xlabel('Iteration')
+    plt.ylabel('PSNR')
+    plt.title('Test PSNR during Training')
+    plt.grid(True)
+    plt.savefig(save_path)
+    plt.close()
+    print(f"PSNR curve saved to {save_path}")
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    # 1. 初始化高斯模型（Scaffold-GS 特有的锚点参数）
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+    # 2. 加载场景（包含相机参数和初始点云）
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
+    # 3. 设置优化器和学习率策略
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -97,6 +122,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+
+    # 新增：用于记录测试 PSNR 的列表
+    test_psnrs = []
+    test_iters = []
+
+    # 训练循环
     for iteration in range(first_iter, opt.iterations + 1):        
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
@@ -159,7 +190,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
+            # 修改：接收 training_report 返回的测试集 PSNR（已转换为 Python float）
+            test_psnr_val = training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
+            if test_psnr_val is not None:
+                # 确保存入的是 Python float，避免后续绘图时因 CUDA 张量导致错误
+                test_psnrs.append(test_psnr_val)
+                test_iters.append(iteration)
+
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -186,6 +223,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+    # 训练结束后绘制 PSNR 曲线
+    if test_iters and test_psnrs:
+        curve_save_path = os.path.join(args.model_path, "psnr_curve.png")
+        plot_psnr_curve(test_iters, test_psnrs, curve_save_path)
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -209,6 +251,7 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
+    # 修改：增加返回值，当 iteration 在 testing_iterations 中时返回测试集平均 PSNR（Python float），否则返回 None
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
@@ -224,6 +267,8 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+
+        test_psnr_avg = None  # 用于存储测试集平均 PSNR
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -268,12 +313,20 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                 if wandb is not None:
                     wandb.log({f"{config['name']}_loss_viewpoint_l1_loss":l1_test, f"{config['name']}_PSNR":psnr_test})
 
+                # 如果是 test 集，保存平均 PSNR（转换为 Python float）
+                if config['name'] == 'test':
+                    test_psnr_avg = psnr_test.item()  # 转换为 float
+
         if tb_writer:
             # tb_writer.add_histogram(f'{dataset_name}/'+"scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar(f'{dataset_name}/'+'total_points', scene.gaussians.get_anchor.shape[0], iteration)
         torch.cuda.empty_cache()
 
         scene.gaussians.train()
+
+        return test_psnr_avg  # 返回测试集平均 PSNR（float）
+    else:
+        return None
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")

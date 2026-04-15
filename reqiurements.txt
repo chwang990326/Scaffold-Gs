@@ -1,0 +1,8 @@
+numpy<2.0.0
+opencv-python
+pillow
+tqdm
+scipy
+transformers
+safetensors
+accelerate
