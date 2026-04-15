@@ -19,3 +19,6 @@ screenshots
 *.safetensors
 checkpoints
 output
+weights
+submodules
+SIBR_viewers
