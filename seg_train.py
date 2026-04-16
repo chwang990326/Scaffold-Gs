@@ -24,6 +24,7 @@ import torchvision
 import json
 import wandb
 import time
+import torch.nn.functional as F
 from os import makedirs
 import shutil, pathlib
 from pathlib import Path
@@ -138,6 +139,44 @@ def export_semantic_point_cloud(anchors, semantic_features, output_path, logger=
         if logger: logger.error(f"[ERROR] 导出语义点云失败: {e}")
 
 
+def get_semantic_loss_scale(iteration, opt):
+    if iteration < opt.semantic_loss_start_iter:
+        return 0.0
+    if opt.semantic_loss_ramp_iters <= 0:
+        return 1.0
+    progress = (iteration - opt.semantic_loss_start_iter + 1) / float(opt.semantic_loss_ramp_iters)
+    return min(max(progress, 0.0), 1.0)
+
+
+def compute_semantic_loss(gaussians, visible_mask, opt):
+    semantic_features = gaussians.semantic_features
+    semantic_adapter = gaussians.semantic_adapter
+
+    if semantic_adapter is None or semantic_features.dim() != 2 or semantic_features.shape[0] == 0:
+        return None
+    if semantic_features.shape[0] != gaussians.get_anchor.shape[0]:
+        return None
+    if hasattr(semantic_adapter, "in_features") and semantic_adapter.in_features != semantic_features.shape[1]:
+        return None
+
+    semantic_valid_mask = semantic_features.abs().sum(dim=1) > 0
+    candidate_mask = visible_mask & semantic_valid_mask
+    valid_indices = torch.nonzero(candidate_mask, as_tuple=False).squeeze(1)
+
+    if valid_indices.numel() < opt.semantic_min_count:
+        return None
+
+    if valid_indices.numel() > opt.semantic_sample_size:
+        sampled = torch.randperm(valid_indices.numel(), device=valid_indices.device)[:opt.semantic_sample_size]
+        valid_indices = valid_indices[sampled]
+
+    anchor_feat = F.normalize(gaussians._anchor_feat[valid_indices], p=2, dim=-1)
+    semantic_targets = semantic_adapter(semantic_features[valid_indices].detach())
+    semantic_targets = F.normalize(semantic_targets, p=2, dim=-1)
+
+    return (1.0 - F.cosine_similarity(anchor_feat, semantic_targets, dim=-1)).mean()
+
+
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sam_checkpoint, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -210,6 +249,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         export_semantic_point_cloud(gaussians.get_anchor, gaussians.semantic_features, sem_ply_path, logger)
 
     # 3. 设置优化器和学习率策略
+    if gaussians.semantic_features.dim() == 2 and gaussians.semantic_features.shape[1] > 0:
+        gaussians.init_semantic_adapter(gaussians.semantic_features.shape[1])
+
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -266,17 +308,32 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+        semantic_loss = None
+        semantic_weight = 0.0
+        semantic_scale = get_semantic_loss_scale(iteration, opt)
+        if opt.semantic_loss_weight > 0 and semantic_scale > 0:
+            semantic_loss = compute_semantic_loss(gaussians, voxel_visible_mask, opt)
+            if semantic_loss is not None:
+                semantic_weight = semantic_scale * opt.semantic_loss_weight
+                loss = loss + semantic_weight * semantic_loss
 
         loss.backward()
         iter_end.record()
 
         with torch.no_grad():
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            semantic_loss_value = semantic_loss.item() if semantic_loss is not None else None
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
+
+            if tb_writer and semantic_loss_value is not None:
+                tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/semantic_loss', semantic_loss_value, iteration)
+                tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/semantic_weight', semantic_weight, iteration)
+            if wandb is not None and semantic_loss_value is not None:
+                wandb.log({"train_semantic_loss": semantic_loss_value, "train_semantic_weight": semantic_weight})
 
             # [保留] 详细日志记录逻辑，传入记录器收集 PSNR 数据
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger, iter_history, psnr_history)

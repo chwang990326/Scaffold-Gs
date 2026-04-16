@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import copy
 import torch
 from functools import reduce
 import numpy as np
@@ -80,6 +81,8 @@ class GaussianModel:
         
         # [新增] 用于存储语义特征 (512 或 128 维)
         self._semantic_features = torch.empty(0, device="cuda") 
+        self.semantic_adapter = None
+        self.semantic_adapter_scheduler_args = None
         
         self.opacity_accum = torch.empty(0)
 
@@ -138,10 +141,28 @@ class GaussianModel:
     def semantic_features(self, features):
         self._semantic_features = features
 
+    def init_semantic_adapter(self, semantic_dim: int) -> None:
+        if semantic_dim <= 0:
+            self.semantic_adapter = None
+            return
+
+        needs_init = (
+            self.semantic_adapter is None or
+            not hasattr(self.semantic_adapter, "in_features") or
+            not hasattr(self.semantic_adapter, "out_features") or
+            self.semantic_adapter.in_features != semantic_dim or
+            self.semantic_adapter.out_features != self.feat_dim
+        )
+
+        if needs_init:
+            self.semantic_adapter = nn.Linear(semantic_dim, self.feat_dim).cuda()
+
     def eval(self):
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
         self.mlp_color.eval()
+        if self.semantic_adapter is not None:
+            self.semantic_adapter.eval()
         if self.appearance_dim > 0:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
@@ -151,6 +172,8 @@ class GaussianModel:
         self.mlp_opacity.train()
         self.mlp_cov.train()
         self.mlp_color.train()
+        if self.semantic_adapter is not None:
+            self.semantic_adapter.train()
         if self.appearance_dim > 0:
             self.embedding_appearance.train()
         if self.use_feat_bank:                  
@@ -169,11 +192,58 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self._semantic_features, # 增加语义捕获
+            self.semantic_adapter.state_dict() if self.semantic_adapter is not None else None,
         )
+
+    def _build_aligned_semantic_features(self, num_anchors: int, source_features=None):
+        if source_features is not None and source_features.dim() == 2 and source_features.shape[1] > 0:
+            aligned_features = torch.zeros((num_anchors, source_features.shape[1]), device="cuda")
+            min_len = min(num_anchors, source_features.shape[0])
+            aligned_features[:min_len] = source_features[:min_len]
+            return aligned_features
+        return torch.zeros((num_anchors, 128), device="cuda")
+
+    def _load_optimizer_state_compat(self, opt_dict):
+        if opt_dict is None:
+            return
+
+        try:
+            self.optimizer.load_state_dict(opt_dict)
+            return
+        except ValueError:
+            current_state = self.optimizer.state_dict()
+            saved_groups = opt_dict.get("param_groups", [])
+            current_groups = current_state.get("param_groups", [])
+            saved_names = [group.get("name") for group in saved_groups]
+            current_names = [group.get("name") for group in current_groups]
+
+            if len(saved_groups) > len(current_groups) or saved_names != current_names[:len(saved_names)]:
+                raise
+
+            merged_state = copy.deepcopy(opt_dict)
+            merged_state["param_groups"] = copy.deepcopy(saved_groups)
+            merged_state["param_groups"].extend(copy.deepcopy(current_groups[len(saved_groups):]))
+            self.optimizer.load_state_dict(merged_state)
     
     def restore(self, model_args, training_args):
+        semantic_adapter_state = None
+        previous_semantic = self._semantic_features if self._semantic_features.dim() == 2 else None
+
         # [关键修复] 兼容检查点加载，防止尝试加载之前没有保存语义的检查点时发生 unpack 报错
-        if len(model_args) == 11:
+        if len(model_args) == 12:
+            (self._anchor, 
+            self._offset,
+            self._anchor_feat,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            offset_denom,
+            opt_dict, 
+            self.spatial_lr_scale,
+            self._semantic_features,
+            semantic_adapter_state) = model_args
+        elif len(model_args) == 11:
             (self._anchor, 
             self._offset,
             self._anchor_feat,
@@ -197,11 +267,20 @@ class GaussianModel:
             offset_denom,
             opt_dict, 
             self.spatial_lr_scale) = model_args
-            self._semantic_features = torch.zeros((self._anchor.shape[0], 128), device="cuda")
+            self._semantic_features = self._build_aligned_semantic_features(self._anchor.shape[0], previous_semantic)
+
+        if self._semantic_features.shape[0] != self._anchor.shape[0]:
+            self._semantic_features = self._build_aligned_semantic_features(self._anchor.shape[0], self._semantic_features)
+
+        if semantic_adapter_state is not None:
+            self.init_semantic_adapter(semantic_adapter_state["weight"].shape[1])
+            self.semantic_adapter.load_state_dict(semantic_adapter_state)
+        elif self._semantic_features.dim() == 2 and self._semantic_features.shape[1] > 0:
+            self.init_semantic_adapter(self._semantic_features.shape[1])
 
         self.training_setup(training_args)
         self.offset_denom = offset_denom
-        self.optimizer.load_state_dict(opt_dict)
+        self._load_optimizer_state_compat(opt_dict)
 
     def set_appearance(self, num_cameras):
         if self.appearance_dim > 0:
@@ -312,12 +391,15 @@ class GaussianModel:
             {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
             {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
         ]
-        
+
         if self.use_feat_bank:
             l.append({'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"})
         
         if self.appearance_dim > 0:
             l.append({'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"})
+
+        if self.semantic_adapter is not None:
+            l.append({'params': self.semantic_adapter.parameters(), 'lr': training_args.semantic_adapter_lr, "name": "semantic_adapter"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -350,6 +432,10 @@ class GaussianModel:
                                                                 lr_final=training_args.appearance_lr_final,
                                                                 lr_delay_mult=training_args.appearance_lr_delay_mult,
                                                                 max_steps=training_args.appearance_lr_max_steps)
+        if self.semantic_adapter is not None:
+            self.semantic_adapter_scheduler_args = get_expon_lr_func(lr_init=training_args.semantic_adapter_lr,
+                                                                    lr_final=training_args.semantic_adapter_lr,
+                                                                    max_steps=training_args.position_lr_max_steps)
 
     def update_learning_rate(self, iteration):
         for param_group in self.optimizer.param_groups:
@@ -367,6 +453,8 @@ class GaussianModel:
                 param_group['lr'] = self.mlp_featurebank_scheduler_args(iteration)
             if self.appearance_dim > 0 and param_group["name"] == "embedding_appearance":
                 param_group['lr'] = self.appearance_scheduler_args(iteration)
+            if self.semantic_adapter is not None and param_group["name"] == "semantic_adapter":
+                param_group['lr'] = self.semantic_adapter_scheduler_args(iteration)
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']

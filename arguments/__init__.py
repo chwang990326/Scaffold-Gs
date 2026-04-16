@@ -107,6 +107,7 @@ class OptimizationParams(ParamGroup):
         self.opacity_lr = 0.02
         self.scaling_lr = 0.007
         self.rotation_lr = 0.002
+        self.semantic_adapter_lr = 0.005
         
         
         self.mlp_opacity_lr_init = 0.002
@@ -151,6 +152,11 @@ class OptimizationParams(ParamGroup):
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
+        self.semantic_loss_weight = 0.01
+        self.semantic_loss_start_iter = 1_500
+        self.semantic_loss_ramp_iters = 2_000
+        self.semantic_sample_size = 4_096
+        self.semantic_min_count = 64
 
         super().__init__(parser, "Optimization Parameters")
 
