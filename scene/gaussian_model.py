@@ -531,7 +531,7 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if 'mlp' in group['name'] or 'conv' in group['name'] or 'feat_base' in group['name'] or 'embedding' in group['name']:
+            if 'mlp' in group['name'] or 'conv' in group['name'] or 'feat_base' in group['name'] or 'embedding' in group['name'] or group["name"] == "semantic_adapter":
                 continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
@@ -575,7 +575,7 @@ class GaussianModel:
     def _prune_anchor_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if 'mlp' in group['name'] or 'conv' in group['name'] or 'feat_base' in group['name'] or 'embedding' in group['name']:
+            if 'mlp' in group['name'] or 'conv' in group['name'] or 'feat_base' in group['name'] or 'embedding' in group['name'] or group["name"] == "semantic_adapter":
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
