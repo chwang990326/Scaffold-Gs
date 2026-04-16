@@ -476,6 +476,23 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             json.dump(per_view_dict, fp, indent=True)
     return t_list, visible_count_list
 
+
+def log_fps_stats(name, timings, logger):
+    if logger is None:
+        return
+    if not timings:
+        logger.warning(f"[EVAL] No rendered views for {name}; skipping FPS calculation.")
+        return
+    valid_timings = timings[5:] if len(timings) > 5 else timings
+    if len(valid_timings) == 0:
+        logger.warning(f"[EVAL] Not enough rendered views for {name}; skipping FPS calculation.")
+        return
+    mean_time = torch.tensor(valid_timings).mean().item()
+    if mean_time <= 0:
+        logger.warning(f"[EVAL] Invalid mean render time for {name}; skipping FPS calculation.")
+        return
+    logger.info(f'{name} FPS: {1.0 / mean_time:.5f}')
+
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
@@ -488,15 +505,17 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         # [保留] 训练集渲染分支与 FPS 计算
         if not skip_train:
             t_train_list, _ = render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
-            logger.info(f'Train FPS: {1.0 / torch.tensor(t_train_list[5:]).mean().item():.5f}')
+            log_fps_stats("Train", t_train_list, logger)
 
         if not skip_test:
             t_test_list, visible_count = render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
-            logger.info(f'Test FPS: {1.0 / torch.tensor(t_test_list[5:]).mean().item():.5f}')
+            log_fps_stats("Test", t_test_list, logger)
     return visible_count
 
 def readImages(renders_dir, gt_dir):
     renders, gts, image_names = [], [], []
+    if not renders_dir.exists() or not gt_dir.exists():
+        return renders, gts, image_names
     for fname in os.listdir(renders_dir):
         render = Image.open(renders_dir / fname)
         gt = Image.open(gt_dir / fname)
@@ -515,10 +534,31 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
     full_dict[scene_dir], per_view_dict[scene_dir] = {}, {}
     test_dir = Path(scene_dir) / "test"
 
-    for method in os.listdir(test_dir):
+    if not test_dir.exists():
+        if logger:
+            logger.warning(f"[EVAL] Test directory not found: {test_dir}. Skipping evaluation.")
+        with open(scene_dir + "/results.json", 'w') as fp:
+            json.dump(full_dict[scene_dir], fp, indent=True)
+        return
+
+    method_names = [method for method in os.listdir(test_dir) if (test_dir / method).is_dir()]
+    if len(method_names) == 0:
+        if logger:
+            logger.warning(f"[EVAL] No test render methods found under: {test_dir}. Skipping evaluation.")
+        with open(scene_dir + "/results.json", 'w') as fp:
+            json.dump(full_dict[scene_dir], fp, indent=True)
+        return
+
+    for method in method_names:
         full_dict[scene_dir][method], per_view_dict[scene_dir][method] = {}, {}
         method_dir = test_dir / method
         renders, gts, image_names = readImages(method_dir / "renders", method_dir / "gt")
+        if len(image_names) == 0:
+            if logger:
+                logger.warning(f"[EVAL] No rendered images found for method {method} in {method_dir}. Skipping metric aggregation.")
+            full_dict[scene_dir][method].update({"num_views": 0})
+            per_view_dict[scene_dir][method].update({"SSIM": {}, "PSNR": {}})
+            continue
         ssims, psnrs, lpipss = [], [], []
 
         for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
@@ -532,7 +572,7 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
         # ==========================================================
         # [新增模块]：生成可视化曲线图并直接拷贝测试图片出来
         # ==========================================================
-        if MATPLOTLIB_FOUND:
+        if MATPLOTLIB_FOUND and len(psnrs) > 0:
             psnr_list = [p.item() for p in psnrs]
             plt.figure(figsize=(12, 5))
             plt.plot(range(len(psnr_list)), psnr_list, marker='.', linestyle='-', color='b')
