@@ -47,6 +47,7 @@ from semantic_init_main import SemanticVoter
 
 # [新增] 导入用于降维可视化点云的库
 from sklearn.decomposition import PCA
+from sklearn.cluster import MiniBatchKMeans
 from plyfile import PlyData, PlyElement
 
 # [新增] 导入 matplotlib 用于生成曲线图
@@ -177,12 +178,62 @@ def compute_semantic_loss(gaussians, visible_mask, opt):
     return (1.0 - F.cosine_similarity(anchor_feat, semantic_targets, dim=-1)).mean()
 
 
+def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
+    num_anchors = gaussians.get_anchor.shape[0]
+    cluster_ids = torch.full((num_anchors,), -1, device="cuda", dtype=torch.long)
+    valid_mask = torch.zeros((num_anchors,), device="cuda", dtype=torch.bool)
+    semantic_features = gaussians.semantic_features
+
+    if (
+        semantic_features.dim() != 2 or
+        semantic_features.shape[0] != num_anchors or
+        semantic_features.shape[1] == 0
+    ):
+        gaussians.set_semantic_routing(cluster_ids, valid_mask, initialized=True)
+        if logger:
+            logger.info("[SEMANTIC] Routing disabled: semantic features are missing or misaligned.")
+        return
+
+    valid_mask = semantic_features.abs().sum(dim=1) > 0
+    valid_count = int(valid_mask.sum().item())
+
+    if valid_count == 0:
+        gaussians.set_semantic_routing(cluster_ids, valid_mask, initialized=True)
+        if logger:
+            logger.info("[SEMANTIC] Routing initialized with shared fallback only: no valid semantic anchors.")
+        return
+
+    normalized_features = F.normalize(semantic_features[valid_mask], p=2, dim=-1)
+    num_experts = max(1, int(getattr(gaussians, "semantic_num_experts", dataset.semantic_num_experts)))
+    effective_clusters = min(num_experts, normalized_features.shape[0])
+
+    if effective_clusters == 1:
+        assigned_clusters = np.zeros((normalized_features.shape[0],), dtype=np.int64)
+    else:
+        kmeans = MiniBatchKMeans(
+            n_clusters=effective_clusters,
+            random_state=opt.semantic_cluster_seed,
+            batch_size=opt.semantic_cluster_batch_size,
+        )
+        assigned_clusters = kmeans.fit_predict(normalized_features.detach().cpu().numpy()).astype(np.int64)
+
+    cluster_ids[valid_mask] = torch.from_numpy(assigned_clusters).to(device="cuda", dtype=torch.long)
+    gaussians.set_semantic_routing(cluster_ids, valid_mask, initialized=True)
+
+    if logger:
+        cluster_hist = torch.bincount(cluster_ids[valid_mask], minlength=num_experts).tolist()
+        logger.info(
+            f"[SEMANTIC] Initialized fixed routing for {valid_count} valid anchors "
+            f"across {effective_clusters}/{num_experts} experts: {cluster_hist}"
+        )
+
+
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sam_checkpoint, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     # 1. 初始化高斯模型
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.semantic_num_experts)
     # 2. 加载场景
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
 
@@ -256,6 +307,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    if not gaussians.semantic_routing_initialized:
+        initialize_semantic_routing(gaussians, dataset, opt, logger)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -496,7 +549,7 @@ def log_fps_stats(name, timings, logger):
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.semantic_num_experts)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]

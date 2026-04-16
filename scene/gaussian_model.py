@@ -58,6 +58,7 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 semantic_num_experts: int = 4,
                  ):
 
         self.feat_dim = feat_dim
@@ -74,6 +75,7 @@ class GaussianModel:
         self.add_opacity_dist = add_opacity_dist
         self.add_cov_dist = add_cov_dist
         self.add_color_dist = add_color_dist
+        self.semantic_num_experts = max(1, int(semantic_num_experts))
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -81,6 +83,9 @@ class GaussianModel:
         
         # [新增] 用于存储语义特征 (512 或 128 维)
         self._semantic_features = torch.empty(0, device="cuda") 
+        self._semantic_cluster_ids = torch.empty(0, device="cuda", dtype=torch.long)
+        self._semantic_valid_mask = torch.empty(0, device="cuda", dtype=torch.bool)
+        self.semantic_routing_initialized = False
         self.semantic_adapter = None
         self.semantic_adapter_scheduler_args = None
         
@@ -126,12 +131,21 @@ class GaussianModel:
         ).cuda()
 
         self.color_dist_dim = 1 if self.add_color_dist else 0
-        self.mlp_color = nn.Sequential(
-            nn.Linear(feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),
+        self.init_semantic_color_modules()
+
+    def _create_color_mlp(self):
+        return nn.Sequential(
+            nn.Linear(self.feat_dim+3+self.color_dist_dim+self.appearance_dim, self.feat_dim),
             nn.ReLU(True),
-            nn.Linear(feat_dim, 3*self.n_offsets),
+            nn.Linear(self.feat_dim, 3*self.n_offsets),
             nn.Sigmoid()
         ).cuda()
+
+    def init_semantic_color_modules(self):
+        self.mlp_color_fallback = self._create_color_mlp()
+        self.mlp_color_experts = nn.ModuleList(
+            [self._create_color_mlp() for _ in range(self.semantic_num_experts)]
+        )
 
     @property
     def semantic_features(self):
@@ -140,6 +154,22 @@ class GaussianModel:
     @semantic_features.setter
     def semantic_features(self, features):
         self._semantic_features = features
+
+    @property
+    def semantic_cluster_ids(self):
+        return self._semantic_cluster_ids
+
+    @semantic_cluster_ids.setter
+    def semantic_cluster_ids(self, cluster_ids):
+        self._semantic_cluster_ids = cluster_ids
+
+    @property
+    def semantic_valid_mask(self):
+        return self._semantic_valid_mask
+
+    @semantic_valid_mask.setter
+    def semantic_valid_mask(self, valid_mask):
+        self._semantic_valid_mask = valid_mask
 
     def init_semantic_adapter(self, semantic_dim: int) -> None:
         if semantic_dim <= 0:
@@ -157,10 +187,157 @@ class GaussianModel:
         if needs_init:
             self.semantic_adapter = nn.Linear(semantic_dim, self.feat_dim).cuda()
 
+    def _build_aligned_semantic_cluster_ids(self, num_anchors: int, source_ids=None):
+        aligned_ids = torch.full((num_anchors,), -1, device="cuda", dtype=torch.long)
+        if source_ids is not None and source_ids.dim() == 1 and source_ids.shape[0] > 0:
+            min_len = min(num_anchors, source_ids.shape[0])
+            aligned_ids[:min_len] = source_ids[:min_len].to(device="cuda", dtype=torch.long)
+        return aligned_ids
+
+    def _build_aligned_semantic_valid_mask(self, num_anchors: int, source_mask=None):
+        aligned_mask = torch.zeros((num_anchors,), device="cuda", dtype=torch.bool)
+        if source_mask is not None and source_mask.dim() == 1 and source_mask.shape[0] > 0:
+            min_len = min(num_anchors, source_mask.shape[0])
+            aligned_mask[:min_len] = source_mask[:min_len].to(device="cuda", dtype=torch.bool)
+        return aligned_mask
+
+    def set_semantic_routing(self, cluster_ids=None, valid_mask=None, initialized=True):
+        num_anchors = self._anchor.shape[0] if self._anchor.dim() > 0 else 0
+        self._semantic_cluster_ids = self._build_aligned_semantic_cluster_ids(num_anchors, cluster_ids)
+        self._semantic_valid_mask = self._build_aligned_semantic_valid_mask(num_anchors, valid_mask)
+        self._semantic_cluster_ids[~self._semantic_valid_mask] = -1
+        self.semantic_routing_initialized = initialized
+
+    def get_semantic_routing_state(self):
+        return {
+            "semantic_cluster_ids": self._semantic_cluster_ids,
+            "semantic_valid_mask": self._semantic_valid_mask,
+            "semantic_num_experts": self.semantic_num_experts,
+            "semantic_routing_initialized": self.semantic_routing_initialized,
+        }
+
+    def load_semantic_routing_state(self, routing_state):
+        if routing_state is None:
+            default_valid_mask = None
+            if (
+                self._semantic_features.dim() == 2 and
+                self._anchor.dim() > 0 and
+                self._semantic_features.shape[0] == self._anchor.shape[0]
+            ):
+                default_valid_mask = self._semantic_features.abs().sum(dim=1) > 0
+            self.set_semantic_routing(valid_mask=default_valid_mask, initialized=False)
+            return
+
+        saved_num_experts = routing_state.get("semantic_num_experts")
+        if saved_num_experts is not None and int(saved_num_experts) != self.semantic_num_experts:
+            self.semantic_num_experts = max(1, int(saved_num_experts))
+            self.init_semantic_color_modules()
+
+        self.set_semantic_routing(
+            cluster_ids=routing_state.get("semantic_cluster_ids"),
+            valid_mask=routing_state.get("semantic_valid_mask"),
+            initialized=bool(routing_state.get("semantic_routing_initialized", True)),
+        )
+
+    def warm_start_color_modules(self, source_state_dict):
+        if source_state_dict is None:
+            return
+        self.mlp_color_fallback.load_state_dict(source_state_dict)
+        for expert in self.mlp_color_experts:
+            expert.load_state_dict(source_state_dict)
+
+    def get_visible_semantic_cluster_ids(self, visible_mask=None):
+        num_anchors = self.get_anchor.shape[0]
+        if self._semantic_cluster_ids.shape[0] != num_anchors or self._semantic_valid_mask.shape[0] != num_anchors:
+            self.load_semantic_routing_state(None)
+
+        if visible_mask is None:
+            visible_mask = torch.ones(num_anchors, dtype=torch.bool, device=self.get_anchor.device)
+
+        visible_cluster_ids = self._semantic_cluster_ids[visible_mask].clone()
+        visible_valid_mask = self._semantic_valid_mask[visible_mask]
+        visible_cluster_ids[~visible_valid_mask] = -1
+        return visible_cluster_ids
+
+    def predict_color(self, color_input, semantic_cluster_ids=None):
+        if color_input.shape[0] == 0:
+            return torch.empty((0, 3 * self.n_offsets), device=color_input.device, dtype=color_input.dtype)
+
+        if semantic_cluster_ids is None or semantic_cluster_ids.shape[0] != color_input.shape[0]:
+            semantic_cluster_ids = torch.full(
+                (color_input.shape[0],),
+                -1,
+                device=color_input.device,
+                dtype=torch.long,
+            )
+        else:
+            semantic_cluster_ids = semantic_cluster_ids.to(device=color_input.device, dtype=torch.long)
+
+        color = torch.empty(
+            (color_input.shape[0], 3 * self.n_offsets),
+            device=color_input.device,
+            dtype=color_input.dtype,
+        )
+
+        fallback_mask = (semantic_cluster_ids < 0) | (semantic_cluster_ids >= self.semantic_num_experts)
+        if fallback_mask.any():
+            color[fallback_mask] = self.mlp_color_fallback(color_input[fallback_mask])
+
+        for expert_idx, expert in enumerate(self.mlp_color_experts):
+            expert_mask = semantic_cluster_ids == expert_idx
+            if expert_mask.any():
+                color[expert_mask] = expert(color_input[expert_mask])
+
+        return color
+
+    def get_module_state(self):
+        module_state = {
+            "mlp_opacity": self.mlp_opacity.state_dict(),
+            "mlp_cov": self.mlp_cov.state_dict(),
+            "mlp_color_fallback": self.mlp_color_fallback.state_dict(),
+            "mlp_color_experts": [expert.state_dict() for expert in self.mlp_color_experts],
+            "semantic_num_experts": self.semantic_num_experts,
+        }
+        if self.use_feat_bank:
+            module_state["feature_bank_mlp"] = self.mlp_feature_bank.state_dict()
+        if self.appearance_dim > 0:
+            module_state["appearance"] = self.embedding_appearance.state_dict()
+        return module_state
+
+    def load_module_state(self, module_state):
+        if module_state is None:
+            return
+
+        saved_num_experts = module_state.get("semantic_num_experts")
+        if saved_num_experts is None and "mlp_color_experts" in module_state:
+            saved_num_experts = len(module_state["mlp_color_experts"])
+        if saved_num_experts is not None and int(saved_num_experts) != self.semantic_num_experts:
+            self.semantic_num_experts = max(1, int(saved_num_experts))
+            self.init_semantic_color_modules()
+
+        if "mlp_opacity" in module_state:
+            self.mlp_opacity.load_state_dict(module_state["mlp_opacity"])
+        if "mlp_cov" in module_state:
+            self.mlp_cov.load_state_dict(module_state["mlp_cov"])
+
+        if "mlp_color_fallback" in module_state:
+            self.warm_start_color_modules(module_state["mlp_color_fallback"])
+            expert_states = module_state.get("mlp_color_experts", [])
+            for idx, expert_state in enumerate(expert_states[:self.semantic_num_experts]):
+                self.mlp_color_experts[idx].load_state_dict(expert_state)
+        elif "color_mlp" in module_state:
+            self.warm_start_color_modules(module_state["color_mlp"])
+
+        if self.use_feat_bank and "feature_bank_mlp" in module_state:
+            self.mlp_feature_bank.load_state_dict(module_state["feature_bank_mlp"])
+        if self.appearance_dim > 0 and "appearance" in module_state:
+            self.embedding_appearance.load_state_dict(module_state["appearance"])
+
     def eval(self):
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
-        self.mlp_color.eval()
+        self.mlp_color_fallback.eval()
+        self.mlp_color_experts.eval()
         if self.semantic_adapter is not None:
             self.semantic_adapter.eval()
         if self.appearance_dim > 0:
@@ -171,7 +348,8 @@ class GaussianModel:
     def train(self):
         self.mlp_opacity.train()
         self.mlp_cov.train()
-        self.mlp_color.train()
+        self.mlp_color_fallback.train()
+        self.mlp_color_experts.train()
         if self.semantic_adapter is not None:
             self.semantic_adapter.train()
         if self.appearance_dim > 0:
@@ -193,6 +371,8 @@ class GaussianModel:
             self.spatial_lr_scale,
             self._semantic_features, # 增加语义捕获
             self.semantic_adapter.state_dict() if self.semantic_adapter is not None else None,
+            self.get_semantic_routing_state(),
+            self.get_module_state(),
         )
 
     def _build_aligned_semantic_features(self, num_anchors: int, source_features=None):
@@ -218,7 +398,7 @@ class GaussianModel:
             current_names = [group.get("name") for group in current_groups]
 
             if len(saved_groups) > len(current_groups) or saved_names != current_names[:len(saved_names)]:
-                raise
+                return
 
             merged_state = copy.deepcopy(opt_dict)
             merged_state["param_groups"] = copy.deepcopy(saved_groups)
@@ -227,10 +407,12 @@ class GaussianModel:
     
     def restore(self, model_args, training_args):
         semantic_adapter_state = None
+        routing_state = None
+        module_state = None
         previous_semantic = self._semantic_features if self._semantic_features.dim() == 2 else None
 
         # [关键修复] 兼容检查点加载，防止尝试加载之前没有保存语义的检查点时发生 unpack 报错
-        if len(model_args) == 12:
+        if len(model_args) >= 12:
             (self._anchor, 
             self._offset,
             self._anchor_feat,
@@ -242,7 +424,11 @@ class GaussianModel:
             opt_dict, 
             self.spatial_lr_scale,
             self._semantic_features,
-            semantic_adapter_state) = model_args
+            semantic_adapter_state) = model_args[:12]
+            if len(model_args) >= 13:
+                routing_state = model_args[12]
+            if len(model_args) >= 14:
+                module_state = model_args[13]
         elif len(model_args) == 11:
             (self._anchor, 
             self._offset,
@@ -278,6 +464,8 @@ class GaussianModel:
         elif self._semantic_features.dim() == 2 and self._semantic_features.shape[1] > 0:
             self.init_semantic_adapter(self._semantic_features.shape[1])
 
+        self.load_semantic_routing_state(routing_state)
+        self.load_module_state(module_state)
         self.training_setup(training_args)
         self.offset_denom = offset_denom
         self._load_optimizer_state_compat(opt_dict)
@@ -308,7 +496,7 @@ class GaussianModel:
 
     @property
     def get_color_mlp(self):
-        return self.mlp_color
+        return self.mlp_color_fallback
     
     @property
     def get_rotation(self):
@@ -372,6 +560,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        self.load_semantic_routing_state(None)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -389,8 +578,11 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
             {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-            {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
+            {'params': self.mlp_color_fallback.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color_fallback"},
         ]
+
+        for expert_idx, expert in enumerate(self.mlp_color_experts):
+            l.append({'params': expert.parameters(), 'lr': training_args.mlp_color_lr_init, "name": f"mlp_color_expert_{expert_idx}"})
 
         if self.use_feat_bank:
             l.append({'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"})
@@ -447,7 +639,7 @@ class GaussianModel:
                 param_group['lr'] = self.mlp_opacity_scheduler_args(iteration)
             if param_group["name"] == "mlp_cov":
                 param_group['lr'] = self.mlp_cov_scheduler_args(iteration)
-            if param_group["name"] == "mlp_color":
+            if param_group["name"] == "mlp_color_fallback" or param_group["name"].startswith("mlp_color_expert_"):
                 param_group['lr'] = self.mlp_color_scheduler_args(iteration)
             if self.use_feat_bank and param_group["name"] == "mlp_featurebank":
                 param_group['lr'] = self.mlp_featurebank_scheduler_args(iteration)
@@ -514,6 +706,8 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        self.load_semantic_routing_state(None)
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -554,6 +748,18 @@ class GaussianModel:
                 self._semantic_features = tensors_dict["semantic_features"]
             else:
                 self._semantic_features = torch.cat((self._semantic_features, tensors_dict["semantic_features"]), dim=0)
+
+        if "semantic_cluster_ids" in tensors_dict:
+            if self._semantic_cluster_ids.dim() != 1 or self._semantic_cluster_ids.shape[0] == 0:
+                self._semantic_cluster_ids = tensors_dict["semantic_cluster_ids"]
+            else:
+                self._semantic_cluster_ids = torch.cat((self._semantic_cluster_ids, tensors_dict["semantic_cluster_ids"]), dim=0)
+
+        if "semantic_valid_mask" in tensors_dict:
+            if self._semantic_valid_mask.dim() != 1 or self._semantic_valid_mask.shape[0] == 0:
+                self._semantic_valid_mask = tensors_dict["semantic_valid_mask"]
+            else:
+                self._semantic_valid_mask = torch.cat((self._semantic_valid_mask, tensors_dict["semantic_valid_mask"]), dim=0)
 
         return optimizable_tensors
 
@@ -596,6 +802,10 @@ class GaussianModel:
         # [新增] 同步删除语义特征
         if self._semantic_features.shape[0] > 0:
             self._semantic_features = self._semantic_features[mask]
+        if self._semantic_cluster_ids.shape[0] > 0:
+            self._semantic_cluster_ids = self._semantic_cluster_ids[mask]
+        if self._semantic_valid_mask.shape[0] > 0:
+            self._semantic_valid_mask = self._semantic_valid_mask[mask]
 
         return optimizable_tensors
 
@@ -652,6 +862,10 @@ class GaussianModel:
                 feat_dim = self._semantic_features.shape[1] if (self._semantic_features.dim() > 1 and self._semantic_features.shape[0] > 0) else 128
                 
                 new_semantic = torch.zeros((candidate_anchor.shape[0], feat_dim), device='cuda')
+                new_semantic_cluster_ids = torch.full((candidate_anchor.shape[0],), -1, device='cuda', dtype=torch.long)
+                new_semantic_valid_mask = torch.zeros((candidate_anchor.shape[0],), device='cuda', dtype=torch.bool)
+                candidate_indices = torch.nonzero(candidate_mask).view(-1)
+                parent_anchor_indices = candidate_indices // self.n_offsets
                 
                 if self._semantic_features.shape[0] > 0:
                     candidate_indices = torch.nonzero(candidate_mask).view(-1) # 获取所有需要生长的索引
@@ -660,6 +874,17 @@ class GaussianModel:
                     
                     # [关键修复] 使用 feat_dim 替代硬编码维度
                     new_semantic = scatter_max(parent_semantic, inverse_indices.unsqueeze(1).expand(-1, feat_dim), dim=0)[0][remove_duplicates]
+
+                if self._semantic_cluster_ids.shape[0] > 0:
+                    parent_cluster_ids = self._semantic_cluster_ids[parent_anchor_indices].float().unsqueeze(1)
+                    reduced_cluster_ids = scatter_max(parent_cluster_ids, inverse_indices.unsqueeze(1), dim=0)[0][remove_duplicates]
+                    new_semantic_cluster_ids = reduced_cluster_ids.squeeze(1).long()
+
+                if self._semantic_valid_mask.shape[0] > 0:
+                    parent_valid_mask = self._semantic_valid_mask[parent_anchor_indices].float().unsqueeze(1)
+                    reduced_valid_mask = scatter_max(parent_valid_mask, inverse_indices.unsqueeze(1), dim=0)[0][remove_duplicates]
+                    new_semantic_valid_mask = reduced_valid_mask.squeeze(1) > 0
+                    new_semantic_cluster_ids[~new_semantic_valid_mask] = -1
                 # =================== [FIX END] ===================
 
                 d = {
@@ -670,6 +895,8 @@ class GaussianModel:
                     "offset": new_offsets,
                     "opacity": new_opacities,
                     "semantic_features": new_semantic,
+                    "semantic_cluster_ids": new_semantic_cluster_ids,
+                    "semantic_valid_mask": new_semantic_valid_mask,
                 }
                 
                 self.anchor_demon = torch.cat([self.anchor_demon, torch.zeros([candidate_anchor.shape[0], 1], device='cuda')], dim=0)
@@ -714,10 +941,18 @@ class GaussianModel:
         if mode == 'split':
             for name, mlp, inp_dim in [('opacity_mlp', self.mlp_opacity, self.feat_dim+3+self.opacity_dist_dim),
                                        ('cov_mlp', self.mlp_cov, self.feat_dim+3+self.cov_dist_dim),
-                                       ('color_mlp', self.mlp_color, self.feat_dim+3+self.color_dist_dim+self.appearance_dim)]:
+                                       ('color_mlp_fallback', self.mlp_color_fallback, self.feat_dim+3+self.color_dist_dim+self.appearance_dim)]:
                 mlp.eval()
                 torch.jit.trace(mlp, torch.rand(1, inp_dim).cuda()).save(os.path.join(path, f'{name}.pt'))
                 mlp.train()
+            for expert_idx, expert in enumerate(self.mlp_color_experts):
+                expert.eval()
+                torch.jit.trace(
+                    expert,
+                    torch.rand(1, self.feat_dim+3+self.color_dist_dim+self.appearance_dim).cuda()
+                ).save(os.path.join(path, f'color_mlp_expert_{expert_idx}.pt'))
+                expert.train()
+            torch.save(self.get_semantic_routing_state(), os.path.join(path, 'semantic_routing_state.pt'))
             if self.use_feat_bank:
                 self.mlp_feature_bank.eval()
                 torch.jit.trace(self.mlp_feature_bank, torch.rand(1, 4).cuda()).save(os.path.join(path, 'feature_bank_mlp.pt'))
@@ -727,22 +962,50 @@ class GaussianModel:
                 torch.jit.trace(self.embedding_appearance, torch.zeros((1,), dtype=torch.long).cuda()).save(os.path.join(path, 'embedding_appearance.pt'))
                 self.embedding_appearance.train()
         elif mode == 'unite':
-            data = {'opacity_mlp': self.mlp_opacity.state_dict(), 'cov_mlp': self.mlp_cov.state_dict(), 'color_mlp': self.mlp_color.state_dict()}
+            data = {
+                'opacity_mlp': self.mlp_opacity.state_dict(),
+                'cov_mlp': self.mlp_cov.state_dict(),
+                'mlp_color_fallback': self.mlp_color_fallback.state_dict(),
+                'mlp_color_experts': [expert.state_dict() for expert in self.mlp_color_experts],
+                'semantic_num_experts': self.semantic_num_experts,
+                'semantic_routing_state': self.get_semantic_routing_state(),
+            }
             if self.use_feat_bank: data['feature_bank_mlp'] = self.mlp_feature_bank.state_dict()
             if self.appearance_dim > 0: data['appearance'] = self.embedding_appearance.state_dict()
             torch.save(data, os.path.join(path, 'checkpoints.pth'))
 
     def load_mlp_checkpoints(self, path, mode = 'split'):
         if mode == 'split':
+            routing_state_path = os.path.join(path, 'semantic_routing_state.pt')
+            routing_state = torch.load(routing_state_path, map_location='cuda') if os.path.exists(routing_state_path) else None
+            if routing_state is not None and routing_state.get("semantic_num_experts") is not None:
+                saved_num_experts = int(routing_state["semantic_num_experts"])
+                if saved_num_experts != self.semantic_num_experts:
+                    self.semantic_num_experts = max(1, saved_num_experts)
+                    self.init_semantic_color_modules()
+
             self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
             self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
-            self.mlp_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
+            fallback_path = os.path.join(path, 'color_mlp_fallback.pt')
+            legacy_color_path = os.path.join(path, 'color_mlp.pt')
+            if os.path.exists(fallback_path):
+                fallback_state = torch.jit.load(fallback_path).cuda().state_dict()
+                self.warm_start_color_modules(fallback_state)
+                for expert_idx in range(self.semantic_num_experts):
+                    expert_path = os.path.join(path, f'color_mlp_expert_{expert_idx}.pt')
+                    if os.path.exists(expert_path):
+                        self.mlp_color_experts[expert_idx].load_state_dict(torch.jit.load(expert_path).cuda().state_dict())
+            elif os.path.exists(legacy_color_path):
+                self.warm_start_color_modules(torch.jit.load(legacy_color_path).cuda().state_dict())
+            else:
+                raise FileNotFoundError(f"Neither {fallback_path} nor {legacy_color_path} exists.")
+
+            self.load_semantic_routing_state(routing_state)
             if self.use_feat_bank: self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0: self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
         elif mode == 'unite':
             ckpt = torch.load(os.path.join(path, 'checkpoints.pth'))
-            self.mlp_opacity.load_state_dict(ckpt['opacity_mlp'])
-            self.mlp_cov.load_state_dict(ckpt['cov_mlp'])
-            self.mlp_color.load_state_dict(ckpt['color_mlp'])
+            self.load_semantic_routing_state(ckpt.get('semantic_routing_state'))
+            self.load_module_state(ckpt)
             if self.use_feat_bank: self.mlp_feature_bank.load_state_dict(ckpt['feature_bank_mlp'])
             if self.appearance_dim > 0: self.embedding_appearance.load_state_dict(ckpt['appearance'])

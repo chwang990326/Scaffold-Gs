@@ -68,16 +68,18 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     opacity = neural_opacity[mask]
 
     # get offset's color
+    semantic_cluster_ids = pc.get_visible_semantic_cluster_ids(visible_mask)
     if pc.appearance_dim > 0:
         if pc.add_color_dist:
-            color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
+            color_input = torch.cat([cat_local_view, appearance], dim=1)
         else:
-            color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
+            color_input = torch.cat([cat_local_view_wodist, appearance], dim=1)
     else:
         if pc.add_color_dist:
-            color = pc.get_color_mlp(cat_local_view)
+            color_input = cat_local_view
         else:
-            color = pc.get_color_mlp(cat_local_view_wodist)
+            color_input = cat_local_view_wodist
+    color = pc.predict_color(color_input, semantic_cluster_ids)
     color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask]
 
     # get offset's cov

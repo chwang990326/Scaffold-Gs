@@ -65,6 +65,7 @@ class ModelParams(ParamGroup):
         self.lod = 0
 
         self.appearance_dim = 32
+        self.semantic_num_experts = 4
         self.lowpoly = False
         self.ds = 1
         self.ratio = 1 # sampling the input point cloud
@@ -157,6 +158,9 @@ class OptimizationParams(ParamGroup):
         self.semantic_loss_ramp_iters = 2_000
         self.semantic_sample_size = 4_096
         self.semantic_min_count = 64
+        self.semantic_cluster_seed = 42
+        self.semantic_cluster_batch_size = 2_048
+        self.semantic_missing_policy = "shared_fallback"
 
         super().__init__(parser, "Optimization Parameters")
 
