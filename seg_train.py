@@ -140,28 +140,47 @@ def export_semantic_point_cloud(anchors, semantic_features, output_path, logger=
         if logger: logger.error(f"[ERROR] 导出语义点云失败: {e}")
 
 
+def get_semantic_supervision_start_iter(opt):
+    return max(opt.semantic_loss_start_iter, opt.update_until + 1)
+
+
 def get_semantic_loss_scale(iteration, opt):
-    if iteration < opt.semantic_loss_start_iter:
+    start_iter = get_semantic_supervision_start_iter(opt)
+    if iteration < start_iter:
         return 0.0
     if opt.semantic_loss_ramp_iters <= 0:
         return 1.0
-    progress = (iteration - opt.semantic_loss_start_iter + 1) / float(opt.semantic_loss_ramp_iters)
+    progress = (iteration - start_iter + 1) / float(opt.semantic_loss_ramp_iters)
     return min(max(progress, 0.0), 1.0)
 
 
 def compute_semantic_loss(gaussians, visible_mask, opt):
     semantic_features = gaussians.semantic_features
     semantic_adapter = gaussians.semantic_adapter
+    anchor_sem_feat = gaussians.anchor_sem_feat
 
     if semantic_adapter is None or semantic_features.dim() != 2 or semantic_features.shape[0] == 0:
         return None
     if semantic_features.shape[0] != gaussians.get_anchor.shape[0]:
         return None
+    if anchor_sem_feat.dim() != 2 or anchor_sem_feat.shape[0] != gaussians.get_anchor.shape[0]:
+        return None
     if hasattr(semantic_adapter, "in_features") and semantic_adapter.in_features != semantic_features.shape[1]:
         return None
 
-    semantic_valid_mask = semantic_features.abs().sum(dim=1) > 0
-    candidate_mask = visible_mask & semantic_valid_mask
+    if gaussians.semantic_valid_mask.dim() == 1 and gaussians.semantic_valid_mask.shape[0] == gaussians.get_anchor.shape[0]:
+        semantic_valid_mask = gaussians.semantic_valid_mask
+    else:
+        semantic_valid_mask = semantic_features.abs().sum(dim=1) > 0
+
+    if gaussians.semantic_confidence.dim() == 1 and gaussians.semantic_confidence.shape[0] == gaussians.get_anchor.shape[0]:
+        semantic_confidence = gaussians.semantic_confidence
+    else:
+        semantic_confidence = semantic_valid_mask.float()
+
+    confidence_threshold = getattr(opt, "semantic_confidence_threshold", 0.6)
+    high_conf_mask = semantic_confidence >= confidence_threshold
+    candidate_mask = visible_mask & semantic_valid_mask & high_conf_mask
     valid_indices = torch.nonzero(candidate_mask, as_tuple=False).squeeze(1)
 
     if valid_indices.numel() < opt.semantic_min_count:
@@ -171,7 +190,7 @@ def compute_semantic_loss(gaussians, visible_mask, opt):
         sampled = torch.randperm(valid_indices.numel(), device=valid_indices.device)[:opt.semantic_sample_size]
         valid_indices = valid_indices[sampled]
 
-    anchor_feat = F.normalize(gaussians._anchor_feat[valid_indices], p=2, dim=-1)
+    anchor_feat = F.normalize(anchor_sem_feat[valid_indices], p=2, dim=-1)
     semantic_targets = semantic_adapter(semantic_features[valid_indices].detach())
     semantic_targets = F.normalize(semantic_targets, p=2, dim=-1)
 
@@ -187,7 +206,9 @@ def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
         semantic_features.shape[0] == num_anchors and
         semantic_features.shape[1] > 0
     )
-    if has_valid_semantics:
+    if gaussians.semantic_valid_mask.dim() == 1 and gaussians.semantic_valid_mask.shape[0] == num_anchors:
+        valid_mask = gaussians.semantic_valid_mask
+    elif has_valid_semantics:
         valid_mask = semantic_features.abs().sum(dim=1) > 0
     else:
         valid_mask = torch.zeros((num_anchors,), device="cuda", dtype=torch.bool)

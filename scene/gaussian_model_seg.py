@@ -80,9 +80,11 @@ class GaussianModel:
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
         self._anchor_feat = torch.empty(0)
+        self._anchor_sem_feat = torch.empty(0)
         
         # [新增] 用于存储语义特征 (512 或 128 维)
         self._semantic_features = torch.empty(0, device="cuda") 
+        self._semantic_confidence = torch.empty(0, device="cuda")
         self._semantic_cluster_ids = torch.empty(0, device="cuda", dtype=torch.long)
         self._semantic_valid_mask = torch.empty(0, device="cuda", dtype=torch.bool)
         self.semantic_routing_initialized = False
@@ -154,6 +156,22 @@ class GaussianModel:
         self._semantic_features = features
 
     @property
+    def anchor_sem_feat(self):
+        return self._anchor_sem_feat
+
+    @anchor_sem_feat.setter
+    def anchor_sem_feat(self, features):
+        self._anchor_sem_feat = features
+
+    @property
+    def semantic_confidence(self):
+        return self._semantic_confidence
+
+    @semantic_confidence.setter
+    def semantic_confidence(self, confidence):
+        self._semantic_confidence = confidence
+
+    @property
     def semantic_cluster_ids(self):
         return self._semantic_cluster_ids
 
@@ -199,6 +217,21 @@ class GaussianModel:
             aligned_mask[:min_len] = source_mask[:min_len].to(device="cuda", dtype=torch.bool)
         return aligned_mask
 
+    def _build_aligned_semantic_confidence(self, num_anchors: int, source_confidence=None):
+        aligned_confidence = torch.zeros((num_anchors,), device="cuda", dtype=torch.float32)
+        if source_confidence is not None and source_confidence.dim() == 1 and source_confidence.shape[0] > 0:
+            min_len = min(num_anchors, source_confidence.shape[0])
+            aligned_confidence[:min_len] = source_confidence[:min_len].to(device="cuda", dtype=torch.float32)
+        return aligned_confidence
+
+    def _build_aligned_anchor_sem_feat(self, num_anchors: int, source_features=None):
+        if source_features is not None and source_features.dim() == 2 and source_features.shape[1] == self.feat_dim:
+            aligned_features = torch.zeros((num_anchors, self.feat_dim), device="cuda")
+            min_len = min(num_anchors, source_features.shape[0])
+            aligned_features[:min_len] = source_features[:min_len].to(device="cuda", dtype=torch.float32)
+            return nn.Parameter(aligned_features.requires_grad_(True))
+        return nn.Parameter(torch.zeros((num_anchors, self.feat_dim), device="cuda").requires_grad_(True))
+
     def set_semantic_routing(self, cluster_ids=None, valid_mask=None, initialized=True):
         num_anchors = self._anchor.shape[0] if self._anchor.dim() > 0 else 0
         self._semantic_cluster_ids = self._build_aligned_semantic_cluster_ids(num_anchors, cluster_ids)
@@ -210,6 +243,7 @@ class GaussianModel:
         return {
             "semantic_cluster_ids": self._semantic_cluster_ids,
             "semantic_valid_mask": self._semantic_valid_mask,
+            "semantic_confidence": self._semantic_confidence,
             "semantic_num_experts": self.semantic_num_experts,
             "semantic_routing_initialized": self.semantic_routing_initialized,
         }
@@ -224,6 +258,7 @@ class GaussianModel:
             ):
                 default_valid_mask = self._semantic_features.abs().sum(dim=1) > 0
             self.set_semantic_routing(valid_mask=default_valid_mask, initialized=False)
+            self._semantic_confidence = self._build_aligned_semantic_confidence(self._anchor.shape[0], self._semantic_confidence)
             return
 
         saved_num_experts = routing_state.get("semantic_num_experts")
@@ -235,6 +270,10 @@ class GaussianModel:
             cluster_ids=routing_state.get("semantic_cluster_ids"),
             valid_mask=routing_state.get("semantic_valid_mask"),
             initialized=bool(routing_state.get("semantic_routing_initialized", True)),
+        )
+        self._semantic_confidence = self._build_aligned_semantic_confidence(
+            self._anchor.shape[0],
+            routing_state.get("semantic_confidence"),
         )
 
     def warm_start_color_modules(self, source_state_dict):
@@ -319,6 +358,8 @@ class GaussianModel:
             self.semantic_adapter.state_dict() if self.semantic_adapter is not None else None,
             self.get_semantic_routing_state(),
             self.get_module_state(),
+            self._anchor_sem_feat,
+            self._semantic_confidence,
         )
 
     def _build_aligned_semantic_features(self, num_anchors: int, source_features=None):
@@ -356,6 +397,10 @@ class GaussianModel:
         routing_state = None
         module_state = None
         previous_semantic = self._semantic_features if self._semantic_features.dim() == 2 else None
+        previous_semantic_confidence = self._semantic_confidence if self._semantic_confidence.dim() == 1 else None
+        previous_anchor_sem_feat = self._anchor_sem_feat if self._anchor_sem_feat.dim() == 2 else None
+        anchor_sem_feat = None
+        semantic_confidence = None
 
         # [关键修复] 兼容检查点加载，防止尝试加载之前没有保存语义的检查点时发生 unpack 报错
         if len(model_args) >= 12:
@@ -375,6 +420,10 @@ class GaussianModel:
                 routing_state = model_args[12]
             if len(model_args) >= 14:
                 module_state = model_args[13]
+            if len(model_args) >= 15:
+                anchor_sem_feat = model_args[14]
+            if len(model_args) >= 16:
+                semantic_confidence = model_args[15]
         elif len(model_args) == 11:
             (self._anchor, 
             self._offset,
@@ -403,6 +452,16 @@ class GaussianModel:
 
         if self._semantic_features.shape[0] != self._anchor.shape[0]:
             self._semantic_features = self._build_aligned_semantic_features(self._anchor.shape[0], self._semantic_features)
+
+        if anchor_sem_feat is not None and anchor_sem_feat.dim() == 2 and anchor_sem_feat.shape[0] == self._anchor.shape[0]:
+            self._anchor_sem_feat = nn.Parameter(anchor_sem_feat.detach().to(device="cuda", dtype=torch.float32).requires_grad_(True))
+        else:
+            self._anchor_sem_feat = self._build_aligned_anchor_sem_feat(self._anchor.shape[0], previous_anchor_sem_feat)
+
+        if semantic_confidence is not None and semantic_confidence.dim() == 1 and semantic_confidence.shape[0] == self._anchor.shape[0]:
+            self._semantic_confidence = semantic_confidence.to(device="cuda", dtype=torch.float32)
+        else:
+            self._semantic_confidence = self._build_aligned_semantic_confidence(self._anchor.shape[0], previous_semantic_confidence)
 
         if semantic_adapter_state is not None:
             self.init_semantic_adapter(semantic_adapter_state["weight"].shape[1])
@@ -502,14 +561,20 @@ class GaussianModel:
         self._anchor = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._offset = nn.Parameter(offsets.requires_grad_(True))
         self._anchor_feat = nn.Parameter(anchors_feat.requires_grad_(True))
+        self._anchor_sem_feat = nn.Parameter(torch.zeros_like(anchors_feat).requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        self._semantic_confidence = torch.zeros((self.get_anchor.shape[0],), device="cuda", dtype=torch.float32)
         self.load_semantic_routing_state(None)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        if self._anchor_sem_feat.dim() != 2 or self._anchor_sem_feat.shape[0] != self.get_anchor.shape[0]:
+            self._anchor_sem_feat = self._build_aligned_anchor_sem_feat(self.get_anchor.shape[0], self._anchor_sem_feat)
+        if self._semantic_confidence.dim() != 1 or self._semantic_confidence.shape[0] != self.get_anchor.shape[0]:
+            self._semantic_confidence = self._build_aligned_semantic_confidence(self.get_anchor.shape[0], self._semantic_confidence)
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
@@ -535,6 +600,7 @@ class GaussianModel:
 
         if self.semantic_adapter is not None:
             l.append({'params': self.semantic_adapter.parameters(), 'lr': training_args.semantic_adapter_lr, "name": "semantic_adapter"})
+        l.append({'params': [self._anchor_sem_feat], 'lr': training_args.feature_lr, "name": "anchor_sem_feat"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -644,12 +710,14 @@ class GaussianModel:
             offsets[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         offsets = offsets.reshape((offsets.shape[0], 3, -1))
         self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._anchor_sem_feat = nn.Parameter(torch.zeros((anchor.shape[0], self.feat_dim), dtype=torch.float, device="cuda").requires_grad_(True))
         self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._anchor = nn.Parameter(torch.tensor(anchor, dtype=torch.float, device="cuda").requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        self._semantic_confidence = torch.zeros((self.get_anchor.shape[0],), device="cuda", dtype=torch.float32)
         self.load_semantic_routing_state(None)
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -704,6 +772,12 @@ class GaussianModel:
             else:
                 self._semantic_valid_mask = torch.cat((self._semantic_valid_mask, tensors_dict["semantic_valid_mask"]), dim=0)
 
+        if "semantic_confidence" in tensors_dict:
+            if self._semantic_confidence.dim() != 1 or self._semantic_confidence.shape[0] == 0:
+                self._semantic_confidence = tensors_dict["semantic_confidence"]
+            else:
+                self._semantic_confidence = torch.cat((self._semantic_confidence, tensors_dict["semantic_confidence"]), dim=0)
+
         return optimizable_tensors
 
     def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
@@ -749,6 +823,8 @@ class GaussianModel:
             self._semantic_cluster_ids = self._semantic_cluster_ids[mask]
         if self._semantic_valid_mask.shape[0] > 0:
             self._semantic_valid_mask = self._semantic_valid_mask[mask]
+        if self._semantic_confidence.shape[0] > 0:
+            self._semantic_confidence = self._semantic_confidence[mask]
 
         return optimizable_tensors
 
@@ -758,6 +834,7 @@ class GaussianModel:
         self._anchor = optimizable_tensors["anchor"]
         self._offset = optimizable_tensors["offset"]
         self._anchor_feat = optimizable_tensors["anchor_feat"]
+        self._anchor_sem_feat = optimizable_tensors["anchor_sem_feat"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -797,6 +874,7 @@ class GaussianModel:
                 new_opacities = inverse_sigmoid(0.1 * torch.ones((candidate_anchor.shape[0], 1), device="cuda"))
                 new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
                 new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
+                new_anchor_sem_feat = torch.zeros((candidate_anchor.shape[0], self.feat_dim), device="cuda")
                 new_offsets = torch.zeros((candidate_anchor.shape[0], self.n_offsets, 3), device="cuda").float()
 
                 # [新增] 为新锚点计算语义特征（继承父代）
@@ -807,6 +885,7 @@ class GaussianModel:
                 new_semantic = torch.zeros((candidate_anchor.shape[0], feat_dim), device='cuda')
                 new_semantic_cluster_ids = torch.full((candidate_anchor.shape[0],), -1, device='cuda', dtype=torch.long)
                 new_semantic_valid_mask = torch.zeros((candidate_anchor.shape[0],), device='cuda', dtype=torch.bool)
+                new_semantic_confidence = torch.zeros((candidate_anchor.shape[0],), device='cuda', dtype=torch.float32)
                 candidate_indices = torch.nonzero(candidate_mask).view(-1)
                 parent_anchor_indices = candidate_indices // self.n_offsets
                 
@@ -828,6 +907,11 @@ class GaussianModel:
                     reduced_valid_mask = scatter_max(parent_valid_mask, inverse_indices.unsqueeze(1), dim=0)[0][remove_duplicates]
                     new_semantic_valid_mask = reduced_valid_mask.squeeze(1) > 0
                     new_semantic_cluster_ids[~new_semantic_valid_mask] = -1
+
+                if self._semantic_confidence.shape[0] > 0:
+                    parent_confidence = self._semantic_confidence[parent_anchor_indices].unsqueeze(1)
+                    reduced_confidence = scatter_max(parent_confidence, inverse_indices.unsqueeze(1), dim=0)[0][remove_duplicates]
+                    new_semantic_confidence = reduced_confidence.squeeze(1)
                 # =================== [FIX END] ===================
 
                 d = {
@@ -835,18 +919,22 @@ class GaussianModel:
                     "scaling": new_scaling,
                     "rotation": new_rotation,
                     "anchor_feat": new_feat,
+                    "anchor_sem_feat": new_anchor_sem_feat,
                     "offset": new_offsets,
                     "opacity": new_opacities,
                     "semantic_features": new_semantic,
                     "semantic_cluster_ids": new_semantic_cluster_ids,
                     "semantic_valid_mask": new_semantic_valid_mask,
+                    "semantic_confidence": new_semantic_confidence,
                 }
                 
                 self.anchor_demon = torch.cat([self.anchor_demon, torch.zeros([candidate_anchor.shape[0], 1], device='cuda')], dim=0)
                 self.opacity_accum = torch.cat([self.opacity_accum, torch.zeros([candidate_anchor.shape[0], 1], device='cuda')], dim=0)
                 optimizable_tensors = self.cat_tensors_to_optimizer(d)
                 self._anchor, self._scaling, self._rotation = optimizable_tensors["anchor"], optimizable_tensors["scaling"], optimizable_tensors["rotation"]
-                self._anchor_feat, self._offset, self._opacity = optimizable_tensors["anchor_feat"], optimizable_tensors["offset"], optimizable_tensors["opacity"]
+                self._anchor_feat = optimizable_tensors["anchor_feat"]
+                self._anchor_sem_feat = optimizable_tensors["anchor_sem_feat"]
+                self._offset, self._opacity = optimizable_tensors["offset"], optimizable_tensors["opacity"]
 
     def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
         grads = (self.offset_gradient_accum / self.offset_denom).nan_to_num(0.0)

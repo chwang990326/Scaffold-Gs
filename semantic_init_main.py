@@ -94,39 +94,45 @@ class SAMCLIPSegmentor:
         self.clip_model.eval()
 
     @torch.no_grad()
-    def process_image(self, image_path, points_per_side=32, iou_thresh=0.88, area_thresh=100):
+    def process_image(self, image_path, points_per_side=32, iou_thresh=0.88, area_thresh=100, boundary_kernel=5, min_interior_area=32):
         """
-        生成单张图像的 Feature Map (存储 CLIP 向量)
+        ???????????Feature Map (??? CLIP ???)
         """
         image_cv = cv2.imread(image_path)
         image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
         h, w, _ = image_rgb.shape
 
-        # 1. SAM 编码
         target_size = 1024
         scale = target_size / max(h, w)
         input_image = cv2.resize(image_rgb, (int(w * scale), int(h * scale))) if scale < 1.0 else image_rgb
         inputs = self.sam_processor(input_image, return_tensors="pt").to(self.device)
         image_embeddings = self.sam_model.vision_encoder(inputs.pixel_values).last_hidden_state
 
-        # 2. 生成点并进行批次分割
         x = np.linspace(0, input_image.shape[1] - 1, points_per_side)
         y = np.linspace(0, input_image.shape[0] - 1, points_per_side)
         xv, yv = np.meshgrid(x, y)
         points_tensor = torch.tensor(np.stack([xv.flatten(), yv.flatten()], axis=1), device=self.device).float().reshape(-1, 1, 1, 2)
-        
+
         final_id_map = torch.zeros((h, w), dtype=torch.int32, device=self.device)
         global_best_scores = torch.zeros((h, w), dtype=torch.float32, device=self.device)
-        
+
         batch_size = 32
         for i in range(0, points_tensor.shape[0], batch_size):
             b_points = points_tensor[i : i+batch_size]
             curr_bs = b_points.shape[0]
             b_embeddings = image_embeddings.repeat(curr_bs, 1, 1, 1)
-            outputs = self.sam_model(image_embeddings=b_embeddings, input_points=b_points, input_labels=torch.ones((curr_bs, 1, 1), device=self.device).long())
-            masks = self.sam_processor.post_process_masks(outputs.pred_masks, [[h, w]] * curr_bs, [[input_image.shape[0], input_image.shape[1]]] * curr_bs)
-            
-            batch_masks = torch.stack(masks).squeeze(1) 
+            outputs = self.sam_model(
+                image_embeddings=b_embeddings,
+                input_points=b_points,
+                input_labels=torch.ones((curr_bs, 1, 1), device=self.device).long(),
+            )
+            masks = self.sam_processor.post_process_masks(
+                outputs.pred_masks,
+                [[h, w]] * curr_bs,
+                [[input_image.shape[0], input_image.shape[1]]] * curr_bs,
+            )
+
+            batch_masks = torch.stack(masks).squeeze(1)
             batch_scores = outputs.iou_scores.squeeze(1)
             best_idx = torch.argmax(batch_scores, dim=1)
             rows = torch.arange(curr_bs, device=self.device)
@@ -139,33 +145,57 @@ class SAMCLIPSegmentor:
                     update_mask = mask_bool & (final_scores[j] > global_best_scores)
                     final_id_map[update_mask] = i + j + 1
                     global_best_scores[update_mask] = final_scores[j]
-            del outputs; torch.cuda.empty_cache()
+            del outputs
+            torch.cuda.empty_cache()
 
-        # 3. 为每个 Mask 提取 CLIP 特征
         unique_ids = torch.unique(final_id_map)
         unique_ids = unique_ids[unique_ids > 0]
-        
+
         id_to_clip_feat = {}
+        id_to_score = {}
+        interior_id_map = torch.zeros_like(final_id_map)
+        kernel = None
+        if boundary_kernel > 1:
+            kernel = np.ones((boundary_kernel, boundary_kernel), dtype=np.uint8)
+
         for mid in unique_ids:
             mask = (final_id_map == mid).cpu().numpy().astype(np.uint8)
             y_indices, x_indices = np.where(mask > 0)
-            if len(y_indices) == 0: continue
-            
-            # 裁剪物体区域 (Crop with Padding)
+            if len(y_indices) == 0:
+                continue
+
+            if kernel is not None:
+                eroded_mask = cv2.erode(mask, kernel, iterations=1)
+                if int(eroded_mask.sum()) >= int(min_interior_area):
+                    interior_mask = eroded_mask
+                else:
+                    interior_mask = np.zeros_like(mask)
+            else:
+                interior_mask = mask
+
+            if interior_mask.any():
+                interior_id_map[torch.from_numpy(interior_mask.astype(bool)).to(self.device)] = mid
+
             y1, y2, x1, x2 = y_indices.min(), y_indices.max(), x_indices.min(), x_indices.max()
-            crop_rgb = image_rgb[y1:y2, x1:x2]
-            
-            # CLIP 提取特征
-            pil_img = PILImage.fromarray(crop_rgb)
-            pil_img = pil_img.convert("RGB")
+            crop_rgb = image_rgb[y1:y2+1, x1:x2+1]
+            crop_mask = mask[y1:y2+1, x1:x2+1].astype(bool)
+            masked_crop_rgb = np.zeros_like(crop_rgb)
+            masked_crop_rgb[crop_mask] = crop_rgb[crop_mask]
+
+            pil_img = PILImage.fromarray(masked_crop_rgb).convert("RGB")
             if pil_img.size[0] <= 10 or pil_img.size[1] <= 10:
-                continue 
+                continue
+
             clip_inputs = self.clip_processor(images=pil_img, return_tensors="pt").to(self.device)
             clip_feat = self.clip_model.get_image_features(**clip_inputs)
-            clip_feat = F.normalize(clip_feat, p=2, dim=-1) # L2 归一化便于计算相似度
+            clip_feat = F.normalize(clip_feat, p=2, dim=-1)
             id_to_clip_feat[mid.item()] = clip_feat.squeeze(0)
 
-        return final_id_map, id_to_clip_feat
+            pixel_scores = global_best_scores[final_id_map == mid]
+            id_to_score[mid.item()] = float(pixel_scores.mean().item()) if pixel_scores.numel() > 0 else 0.0
+
+        return final_id_map, interior_id_map, id_to_clip_feat, id_to_score
+
 
 # ==========================================
 # 3. 3D 关联与特征聚合模块
@@ -179,12 +209,15 @@ def get_intrinsic_matrix(camera):
     return torch.tensor(K, dtype=torch.float32)
 
 class SemanticVoter:
-    def __init__(self, scene_path, sam_model_path, device="cuda"):
+    def __init__(self, scene_path, sam_model_path, device="cuda", boundary_kernel=5, min_interior_area=32, min_views=2):
         self.device = device
         self.scene_path = scene_path
         self.segmentor = SAMCLIPSegmentor(sam_model_path, device=device)
+        self.boundary_kernel = max(1, int(boundary_kernel))
+        self.min_interior_area = max(1, int(min_interior_area))
+        self.min_views = max(1, int(min_views))
         
-        # [新增] 创建存放 2D 可视化掩码的输出文件夹
+        # [???] ?????? 2D ?????????????????
         self.mask_out_dir = os.path.join(scene_path, "semantic_masks_2d")
         os.makedirs(self.mask_out_dir, exist_ok=True)
         print(f"[INFO] 2D Semantic masks will be saved to: {self.mask_out_dir}")
@@ -198,54 +231,45 @@ class SemanticVoter:
 
     def run(self, anchors):
         num_anchors = anchors.shape[0]
-        # 初始化 3D 特征累加器 (CLIP-base 通常为 512 维)
         anchor_features = torch.zeros((num_anchors, 512), device=self.device)
-        anchor_counts = torch.zeros(num_anchors, device=self.device)
+        anchor_score_sums = torch.zeros(num_anchors, device=self.device)
+        anchor_view_counts = torch.zeros(num_anchors, device=self.device)
         
         for img_key in tqdm(self.sorted_image_keys, desc="Lifting Semantics"):
             colmap_img = self.images[img_key]
             colmap_cam = self.cameras[colmap_img.camera_id]
             
-            # [Fix 1] 强制读取 4 倍下采样图像
             full_img_path = os.path.join(self.scene_path, "images_4", colmap_img.name)
-            
             if not os.path.exists(full_img_path):
-                # 容错降级
                 full_img_path = os.path.join(self.scene_path, "images", colmap_img.name)
-            
-            if not os.path.exists(full_img_path): continue
+            if not os.path.exists(full_img_path):
+                continue
 
-            id_map, id_to_feat = self.segmentor.process_image(full_img_path)
+            id_map, interior_id_map, id_to_feat, id_to_score = self.segmentor.process_image(
+                full_img_path,
+                boundary_kernel=self.boundary_kernel,
+                min_interior_area=self.min_interior_area,
+            )
             h, w = id_map.shape
             
-            # =======================================================
-            # [新增] 保存 2D 语义分割图（为不同 ID 分配随机颜色）
-            # =======================================================
             id_map_cpu = id_map.cpu().numpy()
             color_map = np.zeros((h, w, 3), dtype=np.uint8)
             unique_ids = np.unique(id_map_cpu)
             for uid in unique_ids:
-                if uid == 0: continue # 背景保持黑色
-                # 利用 uid 作为随机种子，保证同一物体在单图内颜色一致
-                np.random.seed(int(uid) * 123) 
+                if uid == 0:
+                    continue
+                np.random.seed(int(uid) * 123)
                 color = np.random.randint(0, 255, size=3)
                 color_map[id_map_cpu == uid] = color
 
             mask_save_path = os.path.join(self.mask_out_dir, colmap_img.name)
             mask_save_path = os.path.splitext(mask_save_path)[0] + "_mask.png"
             os.makedirs(os.path.dirname(mask_save_path), exist_ok=True)
-            
-            # cv2.imwrite 需使用 BGR 格式
             cv2.imwrite(mask_save_path, cv2.cvtColor(color_map, cv2.COLOR_RGB2BGR))
-            # =======================================================
             
-            # 投影变换
             K = get_intrinsic_matrix(colmap_cam).to(self.device)
-            
-            # [Fix 2] 自动修正内参
             scale_x = w / colmap_cam.width
             scale_y = h / colmap_cam.height
-            
             if scale_x != 1.0 or scale_y != 1.0:
                 K[0, 0] *= scale_x
                 K[1, 1] *= scale_y
@@ -257,60 +281,68 @@ class SemanticVoter:
             
             pts_cam = (anchors @ R.t()) + T
             depth = pts_cam[:, 2]
-            pts_2d = pts_cam[:, :2] / depth.unsqueeze(1) 
-            pts_2d = pts_2d @ K[:2, :2].t() + K[:2, 2] 
+            pts_2d = pts_cam[:, :2] / depth.unsqueeze(1)
+            pts_2d = pts_2d @ K[:2, :2].t() + K[:2, 2]
             u, v = pts_2d[:, 0].long(), pts_2d[:, 1].long()
             
             valid_mask = (depth > 0.1) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
             valid_indices = torch.where(valid_mask)[0]
-            if len(valid_indices) == 0: continue
+            if len(valid_indices) == 0:
+                continue
             
-            sampled_ids = id_map[v[valid_indices], u[valid_indices]]
+            sampled_ids = interior_id_map[v[valid_indices], u[valid_indices]]
             
             for mid, feat in id_to_feat.items():
                 mask_in_img = (sampled_ids == mid)
                 affected_anchors = valid_indices[mask_in_img]
-                anchor_features[affected_anchors] += feat
-                anchor_counts[affected_anchors] += 1
+                if affected_anchors.numel() == 0:
+                    continue
+                score = float(id_to_score.get(mid, 0.0))
+                anchor_features[affected_anchors] += feat.unsqueeze(0) * score
+                anchor_score_sums[affected_anchors] += score
+                anchor_view_counts[affected_anchors] += 1
             
-            del id_map, id_to_feat; torch.cuda.empty_cache()
+            del id_map, interior_id_map, id_to_feat, id_to_score
+            torch.cuda.empty_cache()
 
-        # 平均化特征
-        mask = anchor_counts > 0
-        anchor_features[mask] /= anchor_counts[mask].unsqueeze(1)
+        mask = anchor_score_sums > 0
+        anchor_features[mask] /= anchor_score_sums[mask].unsqueeze(1)
+        anchor_features[mask] = F.normalize(anchor_features[mask], p=2, dim=-1)
+
+        anchor_confidence = torch.zeros(num_anchors, device=self.device)
+        if mask.any():
+            avg_score = torch.zeros_like(anchor_confidence)
+            avg_score[mask] = anchor_score_sums[mask] / anchor_view_counts[mask].clamp_min(1.0)
+            view_confidence = torch.clamp(anchor_view_counts / float(self.min_views), max=1.0)
+            anchor_confidence = avg_score * view_confidence
+            anchor_confidence[~mask] = 0.0
         
         print(f"[INFO] 3D Feature lifting done. Original shape: {anchor_features.shape}")
 
-        # ==================== [新增: PCA 降维逻辑] ====================
         TARGET_DIM = 128
         if anchor_features.shape[1] > TARGET_DIM:
             print(f"[INFO] Applying PCA to reduce dimensions from {anchor_features.shape[1]} to {TARGET_DIM}...")
-            
-            # 1. 提取有效特征转到 CPU (sklearn 需要)
-            # 我们只用那些被观测到的锚点来拟合 PCA，避免零向量干扰
             valid_mask_cpu = mask.cpu().numpy()
             features_np = anchor_features.cpu().numpy()
             valid_features = features_np[valid_mask_cpu]
             
             if valid_features.shape[0] > TARGET_DIM:
-                # 2. 拟合 PCA
                 pca = PCA(n_components=TARGET_DIM)
                 reduced_valid_features = pca.fit_transform(valid_features)
-                
-                # 3. 构建新的低维 Tensor
                 reduced_features = torch.zeros((num_anchors, TARGET_DIM), device=self.device, dtype=torch.float32)
                 reduced_features[mask] = torch.tensor(reduced_valid_features, device=self.device, dtype=torch.float32)
-                
-                # 4. L2 归一化 (降维后通常需要重新归一化以用于余弦相似度)
                 reduced_features[mask] = F.normalize(reduced_features[mask], p=2, dim=-1)
-                
                 anchor_features = reduced_features
                 print(f"[INFO] PCA done. New shape: {anchor_features.shape}")
             else:
                 print("[WARN] Not enough valid features to run PCA. Skipping.")
-        # ============================================================
 
-        return anchor_features
+        return {
+            "features": anchor_features,
+            "confidence": anchor_confidence,
+            "valid_mask": mask,
+        }
+
 
 if __name__ == "__main__":
     SCENE_PATH = "./data/garden" 
@@ -320,7 +352,7 @@ if __name__ == "__main__":
     dummy_anchors = torch.randn((50000, 3), device="cuda") 
     
     voter = SemanticVoter(SCENE_PATH, SAM_MODEL_DIR)
-    final_features = voter.run(dummy_anchors)
+    final_result = voter.run(dummy_anchors)
     
-    torch.save(final_features, OUTPUT_PATH)
+    torch.save(final_result["features"], OUTPUT_PATH)
     print(f"Saved 3D CLIP features to {OUTPUT_PATH}")
