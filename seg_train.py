@@ -48,7 +48,6 @@ from semantic_init_main import SemanticVoter
 
 # [新增] 导入用于降维可视化点云的库
 from sklearn.decomposition import PCA
-from sklearn.cluster import MiniBatchKMeans
 from plyfile import PlyData, PlyElement
 
 # [新增] 导入 matplotlib 用于生成曲线图
@@ -182,50 +181,23 @@ def compute_semantic_loss(gaussians, visible_mask, opt):
 def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
     num_anchors = gaussians.get_anchor.shape[0]
     cluster_ids = torch.full((num_anchors,), -1, device="cuda", dtype=torch.long)
-    valid_mask = torch.zeros((num_anchors,), device="cuda", dtype=torch.bool)
     semantic_features = gaussians.semantic_features
-
-    if (
-        semantic_features.dim() != 2 or
-        semantic_features.shape[0] != num_anchors or
-        semantic_features.shape[1] == 0
-    ):
-        gaussians.set_semantic_routing(cluster_ids, valid_mask, initialized=True)
-        if logger:
-            logger.info("[SEMANTIC] Routing disabled: semantic features are missing or misaligned.")
-        return
-
-    valid_mask = semantic_features.abs().sum(dim=1) > 0
-    valid_count = int(valid_mask.sum().item())
-
-    if valid_count == 0:
-        gaussians.set_semantic_routing(cluster_ids, valid_mask, initialized=True)
-        if logger:
-            logger.info("[SEMANTIC] Routing initialized with shared fallback only: no valid semantic anchors.")
-        return
-
-    normalized_features = F.normalize(semantic_features[valid_mask], p=2, dim=-1)
-    num_experts = max(1, int(getattr(gaussians, "semantic_num_experts", dataset.semantic_num_experts)))
-    effective_clusters = min(num_experts, normalized_features.shape[0])
-
-    if effective_clusters == 1:
-        assigned_clusters = np.zeros((normalized_features.shape[0],), dtype=np.int64)
+    has_valid_semantics = (
+        semantic_features.dim() == 2 and
+        semantic_features.shape[0] == num_anchors and
+        semantic_features.shape[1] > 0
+    )
+    if has_valid_semantics:
+        valid_mask = semantic_features.abs().sum(dim=1) > 0
     else:
-        kmeans = MiniBatchKMeans(
-            n_clusters=effective_clusters,
-            random_state=opt.semantic_cluster_seed,
-            batch_size=opt.semantic_cluster_batch_size,
-        )
-        assigned_clusters = kmeans.fit_predict(normalized_features.detach().cpu().numpy()).astype(np.int64)
-
-    cluster_ids[valid_mask] = torch.from_numpy(assigned_clusters).to(device="cuda", dtype=torch.long)
+        valid_mask = torch.zeros((num_anchors,), device="cuda", dtype=torch.bool)
     gaussians.set_semantic_routing(cluster_ids, valid_mask, initialized=True)
 
     if logger:
-        cluster_hist = torch.bincount(cluster_ids[valid_mask], minlength=num_experts).tolist()
+        valid_count = int(valid_mask.sum().item())
         logger.info(
-            f"[SEMANTIC] Initialized fixed routing for {valid_count} valid anchors "
-            f"across {effective_clusters}/{num_experts} experts: {cluster_hist}"
+            f"[SEMANTIC] Shared color head enabled. Expert routing disabled; "
+            f"{valid_count} anchors keep semantic validity flags only."
         )
 
 
