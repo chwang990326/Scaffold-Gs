@@ -7,7 +7,7 @@ import cv2
 import collections
 from tqdm import tqdm
 from safetensors.torch import load_file
-from transformers import SamModel, SamProcessor, CLIPModel, CLIPProcessor
+from transformers import SamModel, SamProcessor, CLIPModel, CLIPImageProcessor
 import torch.nn.functional as F
 from PIL import Image as PILImage
 
@@ -81,17 +81,58 @@ class SAMCLIPSegmentor:
     def __init__(self, sam_model_dir, clip_model_name="openai/clip-vit-base-patch32", device="cuda"):
         self.device = device
         
-        # 加载 SAM-HQ
         print(f"[INFO] Loading HQ-SAM from {sam_model_dir}...")
         self.sam_processor = SamProcessor.from_pretrained(sam_model_dir)
         self.sam_model = SamModel.from_pretrained(sam_model_dir).to(device)
         self.sam_model.eval()
 
-        # 加载 CLIP
         print(f"[INFO] Loading CLIP from {clip_model_name}...")
-        self.clip_model = CLIPModel.from_pretrained(clip_model_name).to(device)
-        self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+        self.clip_model, self.clip_image_processor = self._load_clip_components(clip_model_name)
         self.clip_model.eval()
+
+    def _load_clip_components(self, clip_model_name):
+        clip_candidates = []
+        if clip_model_name:
+            clip_candidates.append(clip_model_name)
+
+        local_fallbacks = [
+            "./weights/clip-vit-base-patch32",
+            "./weights/openai/clip-vit-base-patch32",
+            "./weights/openai_clip-vit-base-patch32",
+        ]
+        for candidate in local_fallbacks:
+            if candidate not in clip_candidates:
+                clip_candidates.append(candidate)
+
+        last_error = None
+
+        for candidate in clip_candidates:
+            if not candidate:
+                continue
+            is_local_path = os.path.isdir(candidate)
+            try:
+                model = CLIPModel.from_pretrained(candidate, local_files_only=True).to(self.device)
+                image_processor = CLIPImageProcessor.from_pretrained(candidate, local_files_only=True)
+                print(f"[INFO] CLIP loaded successfully from {candidate}")
+                return model, image_processor
+            except Exception as exc:
+                last_error = exc
+                if is_local_path:
+                    print(f"[WARN] Failed to load local CLIP from {candidate}: {exc}")
+
+        try:
+            model = CLIPModel.from_pretrained(clip_model_name).to(self.device)
+            image_processor = CLIPImageProcessor.from_pretrained(clip_model_name)
+            print(f"[INFO] CLIP downloaded successfully from {clip_model_name}")
+            return model, image_processor
+        except Exception as exc:
+            last_error = exc
+
+        raise RuntimeError(
+            "Failed to load CLIP image model. "
+            "Pass a local HuggingFace CLIP directory with --clip_model_path, "
+            "or pre-download openai/clip-vit-base-patch32 to ./weights/clip-vit-base-patch32."
+        ) from last_error
 
     @torch.no_grad()
     def process_image(self, image_path, points_per_side=32, iou_thresh=0.88, area_thresh=100, boundary_kernel=5, min_interior_area=32):
@@ -186,7 +227,7 @@ class SAMCLIPSegmentor:
             if pil_img.size[0] <= 10 or pil_img.size[1] <= 10:
                 continue
 
-            clip_inputs = self.clip_processor(images=pil_img, return_tensors="pt").to(self.device)
+            clip_inputs = self.clip_image_processor(images=pil_img, return_tensors="pt").to(self.device)
             clip_feat = self.clip_model.get_image_features(**clip_inputs)
             clip_feat = F.normalize(clip_feat, p=2, dim=-1)
             id_to_clip_feat[mid.item()] = clip_feat.squeeze(0)
@@ -209,10 +250,10 @@ def get_intrinsic_matrix(camera):
     return torch.tensor(K, dtype=torch.float32)
 
 class SemanticVoter:
-    def __init__(self, scene_path, sam_model_path, device="cuda", boundary_kernel=5, min_interior_area=32, min_views=2):
+    def __init__(self, scene_path, sam_model_path, clip_model_name="openai/clip-vit-base-patch32", device="cuda", boundary_kernel=5, min_interior_area=32, min_views=2):
         self.device = device
         self.scene_path = scene_path
-        self.segmentor = SAMCLIPSegmentor(sam_model_path, device=device)
+        self.segmentor = SAMCLIPSegmentor(sam_model_path, clip_model_name=clip_model_name, device=device)
         self.boundary_kernel = max(1, int(boundary_kernel))
         self.min_interior_area = max(1, int(min_interior_area))
         self.min_views = max(1, int(min_views))

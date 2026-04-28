@@ -222,7 +222,7 @@ def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
         )
 
 
-def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sam_checkpoint, wandb=None, logger=None, ply_path=None):
+def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sam_checkpoint, clip_model_path, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     # 1. 初始化高斯模型
@@ -278,6 +278,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         voter = SemanticVoter(
             dataset.source_path,
             sam_checkpoint,
+            clip_model_name=clip_model_path,
             device="cuda",
             boundary_kernel=getattr(opt, "semantic_boundary_kernel", 5),
             min_interior_area=getattr(opt, "semantic_min_interior_pixels", 32),
@@ -710,6 +711,7 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", type=str, default = '-1')
     # [新增] 参数指定 SAM 权重路径
     parser.add_argument("--sam_checkpoint", type=str, default="./weights/sam_hq_vit_base", help="Path to SAM-HQ weights")
+    parser.add_argument("--clip_model_path", type=str, default="openai/clip-vit-base-patch32", help="Local path or HF id for CLIP image model")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -732,7 +734,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
     # 启动训练主程序
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.source_path.split('/')[-1],  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sam_checkpoint, wandb=None, logger=logger)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.source_path.split('/')[-1],  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sam_checkpoint, args.clip_model_path, wandb=None, logger=logger)
     
     # 后处理：渲染训练/测试集并评估
     visible_count = render_sets(lp.extract(args), -1, pp.extract(args), skip_train=False, logger=logger)
