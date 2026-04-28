@@ -78,17 +78,21 @@ def read_images_binary(path_to_model_file):
 # ==========================================
 
 class SAMCLIPSegmentor:
-    def __init__(self, sam_model_dir, clip_model_name="openai/clip-vit-base-patch32", device="cuda"):
+    def __init__(self, sam_model_dir, clip_model_name="openai/clip-vit-base-patch32", device="cuda", enable_clip=True):
         self.device = device
+        self.enable_clip = enable_clip
         
         print(f"[INFO] Loading HQ-SAM from {sam_model_dir}...")
         self.sam_processor = SamProcessor.from_pretrained(sam_model_dir)
         self.sam_model = SamModel.from_pretrained(sam_model_dir).to(device)
         self.sam_model.eval()
 
-        print(f"[INFO] Loading CLIP from {clip_model_name}...")
-        self.clip_model, self.clip_image_processor = self._load_clip_components(clip_model_name)
-        self.clip_model.eval()
+        self.clip_model = None
+        self.clip_image_processor = None
+        if self.enable_clip:
+            print(f"[INFO] Loading CLIP from {clip_model_name}...")
+            self.clip_model, self.clip_image_processor = self._load_clip_components(clip_model_name)
+            self.clip_model.eval()
 
     def _load_clip_components(self, clip_model_name):
         clip_candidates = []
@@ -135,10 +139,22 @@ class SAMCLIPSegmentor:
         ) from last_error
 
     @torch.no_grad()
-    def process_image(self, image_path, points_per_side=32, iou_thresh=0.88, area_thresh=100, boundary_kernel=5, min_interior_area=32):
+    def process_image(
+        self,
+        image_path,
+        points_per_side=32,
+        iou_thresh=0.88,
+        area_thresh=100,
+        boundary_kernel=5,
+        min_interior_area=32,
+        compute_clip_features=True,
+    ):
         """
         ???????????Feature Map (??? CLIP ???)
         """
+        if compute_clip_features and (self.clip_model is None or self.clip_image_processor is None):
+            raise RuntimeError("CLIP components are not initialized, but compute_clip_features=True was requested.")
+
         image_cv = cv2.imread(image_path)
         image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
         h, w, _ = image_rgb.shape
@@ -194,6 +210,7 @@ class SAMCLIPSegmentor:
 
         id_to_clip_feat = {}
         id_to_score = {}
+        mask_infos = {}
         interior_id_map = torch.zeros_like(final_id_map)
         kernel = None
         if boundary_kernel > 1:
@@ -217,6 +234,17 @@ class SAMCLIPSegmentor:
             if interior_mask.any():
                 interior_id_map[torch.from_numpy(interior_mask.astype(bool)).to(self.device)] = mid
 
+            pixel_scores = global_best_scores[final_id_map == mid]
+            score = float(pixel_scores.mean().item()) if pixel_scores.numel() > 0 else 0.0
+            id_to_score[mid.item()] = score
+            mask_infos[mid.item()] = {
+                "mask": mask.copy(),
+                "score": score,
+            }
+
+            if not compute_clip_features:
+                continue
+
             y1, y2, x1, x2 = y_indices.min(), y_indices.max(), x_indices.min(), x_indices.max()
             crop_rgb = image_rgb[y1:y2+1, x1:x2+1]
             crop_mask = mask[y1:y2+1, x1:x2+1].astype(bool)
@@ -232,10 +260,7 @@ class SAMCLIPSegmentor:
             clip_feat = F.normalize(clip_feat, p=2, dim=-1)
             id_to_clip_feat[mid.item()] = clip_feat.squeeze(0)
 
-            pixel_scores = global_best_scores[final_id_map == mid]
-            id_to_score[mid.item()] = float(pixel_scores.mean().item()) if pixel_scores.numel() > 0 else 0.0
-
-        return final_id_map, interior_id_map, id_to_clip_feat, id_to_score
+        return final_id_map, interior_id_map, id_to_clip_feat, id_to_score, mask_infos
 
 
 # ==========================================
@@ -250,18 +275,48 @@ def get_intrinsic_matrix(camera):
     return torch.tensor(K, dtype=torch.float32)
 
 class SemanticVoter:
-    def __init__(self, scene_path, sam_model_path, clip_model_name="openai/clip-vit-base-patch32", device="cuda", boundary_kernel=5, min_interior_area=32, min_views=2):
+    def __init__(
+        self,
+        scene_path,
+        sam_model_path,
+        clip_model_name="openai/clip-vit-base-patch32",
+        device="cuda",
+        boundary_kernel=5,
+        min_interior_area=32,
+        min_views=2,
+        enable_clip=True,
+        boundary_mask_score_thresh=0.90,
+        boundary_mask_min_area_ratio=0.005,
+        boundary_mask_max_area_ratio=0.20,
+        boundary_border_ignore_ratio=0.10,
+        boundary_center_outer_ratio=0.15,
+        boundary_center_min_overlap_ratio=0.30,
+    ):
         self.device = device
         self.scene_path = scene_path
-        self.segmentor = SAMCLIPSegmentor(sam_model_path, clip_model_name=clip_model_name, device=device)
+        self.segmentor = SAMCLIPSegmentor(
+            sam_model_path,
+            clip_model_name=clip_model_name,
+            device=device,
+            enable_clip=enable_clip,
+        )
         self.boundary_kernel = max(1, int(boundary_kernel))
         self.min_interior_area = max(1, int(min_interior_area))
         self.min_views = max(1, int(min_views))
+        self.boundary_mask_score_thresh = float(boundary_mask_score_thresh)
+        self.boundary_mask_min_area_ratio = float(boundary_mask_min_area_ratio)
+        self.boundary_mask_max_area_ratio = float(boundary_mask_max_area_ratio)
+        self.boundary_border_ignore_ratio = float(boundary_border_ignore_ratio)
+        self.boundary_center_outer_ratio = float(boundary_center_outer_ratio)
+        self.boundary_center_min_overlap_ratio = float(boundary_center_min_overlap_ratio)
         
         # [???] ?????? 2D ?????????????????
         self.mask_out_dir = os.path.join(scene_path, "semantic_masks_2d")
         os.makedirs(self.mask_out_dir, exist_ok=True)
         print(f"[INFO] 2D Semantic masks will be saved to: {self.mask_out_dir}")
+        self.edge_mask_out_dir = os.path.join(scene_path, "stable_edge_masks")
+        os.makedirs(self.edge_mask_out_dir, exist_ok=True)
+        print(f"[INFO] Stable edge masks will be saved to: {self.edge_mask_out_dir}")
         
         sparse_dir = os.path.join(scene_path, "sparse", "0")
         if not os.path.exists(sparse_dir): sparse_dir = os.path.join(scene_path, "sparse")
@@ -269,6 +324,119 @@ class SemanticVoter:
         self.cameras = read_cameras_binary(os.path.join(sparse_dir, "cameras.bin"))
         self.images = read_images_binary(os.path.join(sparse_dir, "images.bin"))
         self.sorted_image_keys = sorted(self.images.keys(), key=lambda x: self.images[x].name)
+
+    def _resolve_image_path(self, image_name):
+        full_img_path = os.path.join(self.scene_path, "images_4", image_name)
+        if not os.path.exists(full_img_path):
+            full_img_path = os.path.join(self.scene_path, "images", image_name)
+        if not os.path.exists(full_img_path):
+            return None
+        return full_img_path
+
+    def _save_semantic_visualization(self, id_map, image_name):
+        h, w = id_map.shape
+        id_map_cpu = id_map.cpu().numpy()
+        color_map = np.zeros((h, w, 3), dtype=np.uint8)
+        unique_ids = np.unique(id_map_cpu)
+        for uid in unique_ids:
+            if uid == 0:
+                continue
+            np.random.seed(int(uid) * 123)
+            color = np.random.randint(0, 255, size=3)
+            color_map[id_map_cpu == uid] = color
+
+        mask_save_path = os.path.join(self.mask_out_dir, image_name)
+        mask_save_path = os.path.splitext(mask_save_path)[0] + "_mask.png"
+        os.makedirs(os.path.dirname(mask_save_path), exist_ok=True)
+        cv2.imwrite(mask_save_path, cv2.cvtColor(color_map, cv2.COLOR_RGB2BGR))
+
+    def _build_stable_edge_mask(self, mask_infos, height, width):
+        stable_edge_mask = np.zeros((height, width), dtype=np.uint8)
+        if not mask_infos:
+            return stable_edge_mask
+
+        image_area = float(height * width)
+        min_area = max(1.0, self.boundary_mask_min_area_ratio * image_area)
+        max_area = max(min_area, self.boundary_mask_max_area_ratio * image_area)
+
+        border_y = int(round(height * self.boundary_border_ignore_ratio))
+        border_x = int(round(width * self.boundary_border_ignore_ratio))
+        center_margin_y = int(round(height * self.boundary_center_outer_ratio))
+        center_margin_x = int(round(width * self.boundary_center_outer_ratio))
+        center_y0 = min(max(center_margin_y, 0), max(height - 1, 0))
+        center_x0 = min(max(center_margin_x, 0), max(width - 1, 0))
+        center_y1 = max(center_y0 + 1, height - center_margin_y)
+        center_x1 = max(center_x0 + 1, width - center_margin_x)
+
+        center_mask = np.zeros((height, width), dtype=np.uint8)
+        center_mask[center_y0:center_y1, center_x0:center_x1] = 1
+
+        edge_radius = max(2, int(round(min(height, width) / 512.0)))
+        edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (edge_radius * 2 + 1, edge_radius * 2 + 1))
+
+        for mask_info in mask_infos.values():
+            mask = mask_info["mask"].astype(np.uint8)
+            score = float(mask_info["score"])
+            area = int(mask.sum())
+            if score < self.boundary_mask_score_thresh or area < min_area or area > max_area:
+                continue
+
+            y_indices, x_indices = np.where(mask > 0)
+            if len(y_indices) == 0:
+                continue
+
+            touches_border = (
+                y_indices.min() < border_y or
+                y_indices.max() >= (height - border_y) or
+                x_indices.min() < border_x or
+                x_indices.max() >= (width - border_x)
+            )
+            if touches_border:
+                continue
+
+            overlap = float((mask * center_mask).sum())
+            if overlap / max(float(area), 1.0) < self.boundary_center_min_overlap_ratio:
+                continue
+
+            dilated_mask = cv2.dilate(mask, edge_kernel, iterations=1)
+            eroded_mask = cv2.erode(mask, edge_kernel, iterations=1)
+            edge_band = np.clip(dilated_mask - eroded_mask, 0, 1).astype(np.uint8)
+            stable_edge_mask = np.maximum(stable_edge_mask, edge_band)
+
+        return stable_edge_mask
+
+    def _save_stable_edge_mask(self, edge_mask, image_name):
+        image_stem = os.path.splitext(os.path.basename(image_name))[0]
+        edge_path = os.path.join(self.edge_mask_out_dir, f"{image_stem}_edge.png")
+        cv2.imwrite(edge_path, (edge_mask * 255).astype(np.uint8))
+
+    def _process_view(self, colmap_img, compute_clip_features=True):
+        full_img_path = self._resolve_image_path(colmap_img.name)
+        if full_img_path is None:
+            return None
+
+        id_map, interior_id_map, id_to_feat, id_to_score, mask_infos = self.segmentor.process_image(
+            full_img_path,
+            boundary_kernel=self.boundary_kernel,
+            min_interior_area=self.min_interior_area,
+            compute_clip_features=compute_clip_features,
+        )
+        h, w = id_map.shape
+        self._save_semantic_visualization(id_map, colmap_img.name)
+        stable_edge_mask = self._build_stable_edge_mask(mask_infos, h, w)
+        self._save_stable_edge_mask(stable_edge_mask, colmap_img.name)
+
+        return full_img_path, id_map, interior_id_map, id_to_feat, id_to_score
+
+    def export_stable_edge_masks(self):
+        for img_key in tqdm(self.sorted_image_keys, desc="Preparing Stable Edge Masks"):
+            colmap_img = self.images[img_key]
+            processed = self._process_view(colmap_img, compute_clip_features=False)
+            if processed is None:
+                continue
+            _, id_map, interior_id_map, id_to_feat, id_to_score = processed
+            del id_map, interior_id_map, id_to_feat, id_to_score
+            torch.cuda.empty_cache()
 
     def run(self, anchors):
         num_anchors = anchors.shape[0]
@@ -279,34 +447,13 @@ class SemanticVoter:
         for img_key in tqdm(self.sorted_image_keys, desc="Lifting Semantics"):
             colmap_img = self.images[img_key]
             colmap_cam = self.cameras[colmap_img.camera_id]
-            
-            full_img_path = os.path.join(self.scene_path, "images_4", colmap_img.name)
-            if not os.path.exists(full_img_path):
-                full_img_path = os.path.join(self.scene_path, "images", colmap_img.name)
-            if not os.path.exists(full_img_path):
+
+            processed = self._process_view(colmap_img, compute_clip_features=True)
+            if processed is None:
                 continue
 
-            id_map, interior_id_map, id_to_feat, id_to_score = self.segmentor.process_image(
-                full_img_path,
-                boundary_kernel=self.boundary_kernel,
-                min_interior_area=self.min_interior_area,
-            )
+            _, id_map, interior_id_map, id_to_feat, id_to_score = processed
             h, w = id_map.shape
-            
-            id_map_cpu = id_map.cpu().numpy()
-            color_map = np.zeros((h, w, 3), dtype=np.uint8)
-            unique_ids = np.unique(id_map_cpu)
-            for uid in unique_ids:
-                if uid == 0:
-                    continue
-                np.random.seed(int(uid) * 123)
-                color = np.random.randint(0, 255, size=3)
-                color_map[id_map_cpu == uid] = color
-
-            mask_save_path = os.path.join(self.mask_out_dir, colmap_img.name)
-            mask_save_path = os.path.splitext(mask_save_path)[0] + "_mask.png"
-            os.makedirs(os.path.dirname(mask_save_path), exist_ok=True)
-            cv2.imwrite(mask_save_path, cv2.cvtColor(color_map, cv2.COLOR_RGB2BGR))
             
             K = get_intrinsic_matrix(colmap_cam).to(self.device)
             scale_x = w / colmap_cam.width

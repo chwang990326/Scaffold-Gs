@@ -165,6 +165,18 @@ class OptimizationParams(ParamGroup):
         self.semantic_cluster_seed = 42
         self.semantic_cluster_batch_size = 2_048
         self.semantic_missing_policy = "shared_fallback"
+        self.boundary_loss_weight = 0.01
+        self.boundary_loss_start_ratio = 0.6
+        self.boundary_loss_ramp_iters = 2_000
+        self.boundary_mask_score_thresh = 0.90
+        self.boundary_mask_min_area_ratio = 0.005
+        self.boundary_mask_max_area_ratio = 0.20
+        self.boundary_border_ignore_ratio = 0.10
+        self.boundary_center_inner_ratio = 0.25
+        self.boundary_center_outer_ratio = 0.15
+        self.boundary_center_min_overlap_ratio = 0.30
+        self.boundary_gt_grad_thresh = 0.08
+        self.boundary_min_pixels = 256
 
         super().__init__(parser, "Optimization Parameters")
 

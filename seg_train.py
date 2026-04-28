@@ -197,6 +197,159 @@ def compute_semantic_loss(gaussians, visible_mask, opt):
     return (1.0 - F.cosine_similarity(anchor_feat, semantic_targets, dim=-1)).mean()
 
 
+def get_boundary_supervision_start_iter(opt):
+    ratio_start_iter = int(float(getattr(opt, "boundary_loss_start_ratio", 0.6)) * float(opt.iterations))
+    return max(opt.update_until + 1, ratio_start_iter)
+
+
+def get_boundary_loss_scale(iteration, opt):
+    start_iter = get_boundary_supervision_start_iter(opt)
+    if iteration < start_iter:
+        return 0.0
+    if getattr(opt, "boundary_loss_ramp_iters", 0) <= 0:
+        return 1.0
+    progress = (iteration - start_iter + 1) / float(opt.boundary_loss_ramp_iters)
+    return min(max(progress, 0.0), 1.0)
+
+
+def has_stable_edge_masks(boundary_mask_dir):
+    if not os.path.isdir(boundary_mask_dir):
+        return False
+    return any(Path(boundary_mask_dir).rglob("*_edge.png"))
+
+
+def load_stable_edge_mask(boundary_mask_dir, image_name, cache, target_hw, device, dtype):
+    if image_name not in cache:
+        direct_path = os.path.join(boundary_mask_dir, f"{image_name}_edge.png")
+        edge_path = direct_path if os.path.exists(direct_path) else None
+        if edge_path is None:
+            matches = list(Path(boundary_mask_dir).rglob(f"{image_name}_edge.png"))
+            edge_path = str(matches[0]) if matches else None
+
+        if edge_path is None:
+            cache[image_name] = None
+        else:
+            edge_image = Image.open(edge_path).convert("L")
+            edge_array = np.array(edge_image, dtype=np.float32) / 255.0
+            cache[image_name] = torch.from_numpy(edge_array)
+
+    edge_mask = cache[image_name]
+    if edge_mask is None:
+        return None
+
+    edge_mask = edge_mask.to(device=device, dtype=dtype).unsqueeze(0).unsqueeze(0)
+    if edge_mask.shape[-2:] != target_hw:
+        edge_mask = F.interpolate(edge_mask, size=target_hw, mode="nearest")
+    return (edge_mask > 0.5).to(dtype=dtype)
+
+
+def rgb_to_grayscale(image):
+    if image.dim() == 3:
+        image = image.unsqueeze(0)
+    if image.shape[1] == 1:
+        return image
+    return (
+        0.2989 * image[:, 0:1] +
+        0.5870 * image[:, 1:2] +
+        0.1140 * image[:, 2:3]
+    )
+
+
+def sobel_gradient_magnitude(gray_image):
+    kernel_x = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        device=gray_image.device,
+        dtype=gray_image.dtype,
+    ).view(1, 1, 3, 3) / 8.0
+    kernel_y = torch.tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+        device=gray_image.device,
+        dtype=gray_image.dtype,
+    ).view(1, 1, 3, 3) / 8.0
+    grad_x = F.conv2d(gray_image, kernel_x, padding=1)
+    grad_y = F.conv2d(gray_image, kernel_y, padding=1)
+    return torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
+
+
+def build_center_axis_weights(length, inner_margin, outer_margin, device, dtype):
+    inner_margin = min(max(float(inner_margin), 0.0), 0.49)
+    outer_margin = min(max(float(outer_margin), 0.0), 0.49)
+    if outer_margin > inner_margin:
+        outer_margin, inner_margin = inner_margin, outer_margin
+    if abs(inner_margin - outer_margin) < 1e-6:
+        outer_margin = max(0.0, inner_margin - 1e-3)
+
+    coords = torch.linspace(0.0, 1.0, steps=length, device=device, dtype=dtype)
+    weights = torch.zeros_like(coords)
+    inner_left = inner_margin
+    inner_right = 1.0 - inner_margin
+    outer_left = outer_margin
+    outer_right = 1.0 - outer_margin
+
+    inner_mask = (coords >= inner_left) & (coords <= inner_right)
+    weights[inner_mask] = 1.0
+
+    if inner_left > outer_left:
+        left_mask = (coords >= outer_left) & (coords < inner_left)
+        weights[left_mask] = (coords[left_mask] - outer_left) / max(inner_left - outer_left, 1e-6)
+
+        right_mask = (coords > inner_right) & (coords <= outer_right)
+        weights[right_mask] = (outer_right - coords[right_mask]) / max(outer_right - inner_right, 1e-6)
+
+    return weights.clamp_(0.0, 1.0)
+
+
+def get_center_weight_map(height, width, opt, device, dtype, cache):
+    cache_key = (height, width, str(device), str(dtype))
+    if cache_key not in cache:
+        x_weights = build_center_axis_weights(
+            width,
+            getattr(opt, "boundary_center_inner_ratio", 0.25),
+            getattr(opt, "boundary_center_outer_ratio", 0.15),
+            device,
+            dtype,
+        )
+        y_weights = build_center_axis_weights(
+            height,
+            getattr(opt, "boundary_center_inner_ratio", 0.25),
+            getattr(opt, "boundary_center_outer_ratio", 0.15),
+            device,
+            dtype,
+        )
+        cache[cache_key] = (y_weights[:, None] * x_weights[None, :]).unsqueeze(0).unsqueeze(0)
+    return cache[cache_key]
+
+
+def compute_boundary_sharpen_loss(rendered_image, gt_image, image_name, boundary_mask_dir, opt, mask_cache, center_weight_cache):
+    height, width = rendered_image.shape[-2:]
+    edge_mask = load_stable_edge_mask(
+        boundary_mask_dir,
+        image_name,
+        mask_cache,
+        (height, width),
+        rendered_image.device,
+        rendered_image.dtype,
+    )
+    if edge_mask is None:
+        return None, 0
+
+    render_gray = rgb_to_grayscale(rendered_image)
+    gt_gray = rgb_to_grayscale(gt_image)
+    render_grad = sobel_gradient_magnitude(render_gray)
+    gt_grad = sobel_gradient_magnitude(gt_gray)
+    center_weight = get_center_weight_map(height, width, opt, rendered_image.device, rendered_image.dtype, center_weight_cache)
+    gt_edge_mask = (gt_grad > getattr(opt, "boundary_gt_grad_thresh", 0.08)).to(dtype=rendered_image.dtype)
+    final_weight = edge_mask * center_weight * gt_edge_mask
+    active_pixels = int((final_weight > 0).sum().item())
+
+    if active_pixels < int(getattr(opt, "boundary_min_pixels", 256)):
+        return None, active_pixels
+
+    grad_diff = torch.sqrt((render_grad - gt_grad).pow(2) + 1e-6)
+    loss = (grad_diff * final_weight).sum() / final_weight.sum().clamp_min(1e-6)
+    return loss, active_pixels
+
+
 def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
     num_anchors = gaussians.get_anchor.shape[0]
     cluster_ids = torch.full((num_anchors,), -1, device="cuda", dtype=torch.long)
@@ -225,6 +378,9 @@ def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sam_checkpoint, clip_model_path, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    boundary_mask_dir = os.path.join(dataset.source_path, "stable_edge_masks")
+    boundary_mask_cache = {}
+    center_weight_cache = {}
     # 1. 初始化高斯模型
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.semantic_num_experts)
@@ -283,6 +439,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             boundary_kernel=getattr(opt, "semantic_boundary_kernel", 5),
             min_interior_area=getattr(opt, "semantic_min_interior_pixels", 32),
             min_views=getattr(opt, "semantic_min_views", 2),
+            boundary_mask_score_thresh=getattr(opt, "boundary_mask_score_thresh", 0.90),
+            boundary_mask_min_area_ratio=getattr(opt, "boundary_mask_min_area_ratio", 0.005),
+            boundary_mask_max_area_ratio=getattr(opt, "boundary_mask_max_area_ratio", 0.20),
+            boundary_border_ignore_ratio=getattr(opt, "boundary_border_ignore_ratio", 0.10),
+            boundary_center_outer_ratio=getattr(opt, "boundary_center_outer_ratio", 0.15),
+            boundary_center_min_overlap_ratio=getattr(opt, "boundary_center_min_overlap_ratio", 0.30),
         )
         semantic_result = voter.run(real_anchors)
         
@@ -308,6 +470,33 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gaussians.semantic_valid_mask = torch.zeros((gaussians.get_anchor.shape[0],), device="cuda", dtype=torch.bool)
     # ===========================================================================================
 
+    boundary_masks_ready = has_stable_edge_masks(boundary_mask_dir)
+    if getattr(opt, "boundary_loss_weight", 0.0) > 0 and not boundary_masks_ready:
+        if sam_checkpoint and os.path.exists(sam_checkpoint):
+            logger.info("[BOUNDARY] No stable edge masks found. Exporting SAM-based boundary masks for sharpening supervision.")
+            boundary_voter = SemanticVoter(
+                dataset.source_path,
+                sam_checkpoint,
+                clip_model_name=clip_model_path,
+                device="cuda",
+                boundary_kernel=getattr(opt, "semantic_boundary_kernel", 5),
+                min_interior_area=getattr(opt, "semantic_min_interior_pixels", 32),
+                min_views=getattr(opt, "semantic_min_views", 2),
+                enable_clip=False,
+                boundary_mask_score_thresh=getattr(opt, "boundary_mask_score_thresh", 0.90),
+                boundary_mask_min_area_ratio=getattr(opt, "boundary_mask_min_area_ratio", 0.005),
+                boundary_mask_max_area_ratio=getattr(opt, "boundary_mask_max_area_ratio", 0.20),
+                boundary_border_ignore_ratio=getattr(opt, "boundary_border_ignore_ratio", 0.10),
+                boundary_center_outer_ratio=getattr(opt, "boundary_center_outer_ratio", 0.15),
+                boundary_center_min_overlap_ratio=getattr(opt, "boundary_center_min_overlap_ratio", 0.30),
+            )
+            boundary_voter.export_stable_edge_masks()
+            del boundary_voter
+            torch.cuda.empty_cache()
+            boundary_masks_ready = has_stable_edge_masks(boundary_mask_dir)
+        else:
+            logger.warning("[BOUNDARY] Stable edge masks are missing and SAM checkpoint is unavailable. Boundary sharpening supervision will be skipped.")
+
     # [新增] 在获取完语义特征后，立刻执行 PCA 降维并导出可供外部软件查看的点云文件
     if gaussians.semantic_features.shape[0] > 0 and gaussians.semantic_features.shape[1] >= 3:
         sem_ply_path = os.path.join(dataset.model_path, "anchor_semantic_pca_vis.ply")
@@ -329,6 +518,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             f"[SEMANTIC] Supervision starts at iter {get_semantic_supervision_start_iter(opt)} "
             f"with confidence threshold {getattr(opt, 'semantic_confidence_threshold', 0.6):.2f}."
         )
+        logger.info(
+            f"[BOUNDARY] Supervision starts at iter {get_boundary_supervision_start_iter(opt)} "
+            f"with weight {getattr(opt, 'boundary_loss_weight', 0.01):.4f}."
+        )
+        if boundary_masks_ready:
+            logger.info(f"[BOUNDARY] Stable edge masks ready at {boundary_mask_dir}.")
+        else:
+            logger.info("[BOUNDARY] Stable edge masks not found; auxiliary boundary loss stays inactive.")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -389,6 +586,23 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if semantic_loss is not None:
                 semantic_weight = semantic_scale * opt.semantic_loss_weight
                 loss = loss + semantic_weight * semantic_loss
+        boundary_loss = None
+        boundary_weight = 0.0
+        boundary_active_pixels = 0
+        boundary_scale = get_boundary_loss_scale(iteration, opt)
+        if boundary_masks_ready and getattr(opt, "boundary_loss_weight", 0.0) > 0 and boundary_scale > 0:
+            boundary_loss, boundary_active_pixels = compute_boundary_sharpen_loss(
+                image,
+                gt_image,
+                viewpoint_cam.image_name,
+                boundary_mask_dir,
+                opt,
+                boundary_mask_cache,
+                center_weight_cache,
+            )
+            if boundary_loss is not None:
+                boundary_weight = boundary_scale * opt.boundary_loss_weight
+                loss = loss + boundary_weight * boundary_loss
 
         loss.backward()
         iter_end.record()
@@ -396,6 +610,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         with torch.no_grad():
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             semantic_loss_value = semantic_loss.item() if semantic_loss is not None else None
+            boundary_loss_value = boundary_loss.item() if boundary_loss is not None else None
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                 progress_bar.update(10)
@@ -407,6 +622,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/semantic_weight', semantic_weight, iteration)
             if wandb is not None and semantic_loss_value is not None:
                 wandb.log({"train_semantic_loss": semantic_loss_value, "train_semantic_weight": semantic_weight})
+            if tb_writer and boundary_loss_value is not None:
+                tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/boundary_loss', boundary_loss_value, iteration)
+                tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/boundary_weight', boundary_weight, iteration)
+                tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/boundary_active_pixels', boundary_active_pixels, iteration)
+            if wandb is not None and boundary_loss_value is not None:
+                wandb.log({
+                    "train_boundary_loss": boundary_loss_value,
+                    "train_boundary_weight": boundary_weight,
+                    "train_boundary_active_pixels": boundary_active_pixels,
+                })
 
             # [保留] 详细日志记录逻辑，传入记录器收集 PSNR 数据
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger, iter_history, psnr_history)
