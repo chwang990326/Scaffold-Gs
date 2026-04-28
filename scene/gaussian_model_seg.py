@@ -271,9 +271,12 @@ class GaussianModel:
             valid_mask=routing_state.get("semantic_valid_mask"),
             initialized=bool(routing_state.get("semantic_routing_initialized", True)),
         )
+        confidence_source = routing_state.get("semantic_confidence")
+        if confidence_source is None:
+            confidence_source = self._semantic_confidence
         self._semantic_confidence = self._build_aligned_semantic_confidence(
             self._anchor.shape[0],
-            routing_state.get("semantic_confidence"),
+            confidence_source,
         )
 
     def warm_start_color_modules(self, source_state_dict):

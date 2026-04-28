@@ -234,57 +234,77 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     # ========================== [核心：语义提升逻辑 (已修改为支持断点加载)] ==========================
     # 定义保存路径
     sem_save_path = os.path.join(dataset.model_path, "anchor_semantic_features.pt")
+    sem_conf_save_path = os.path.join(dataset.model_path, "anchor_semantic_confidence.pt")
     TARGET_SEMANTIC_DIM = 128
     
-    # 情况 A: 文件已存在 -> 直接加载
     if os.path.exists(sem_save_path):
-        logger.info(f"\n[SEMANTIC] 检测到已存在的语义特征文件: {sem_save_path}")
-        logger.info("[SEMANTIC] 正在直接加载，跳过 SAM/CLIP 提取步骤...")
+        logger.info(f"[SEMANTIC] Loading cached semantic features from {sem_save_path}")
         loaded_features = torch.load(sem_save_path, map_location="cuda")
         
-        # [关键修复]：确保加载的特征维度与当前锚点完全一致
         if loaded_features.shape[0] != gaussians.get_anchor.shape[0]:
-            logger.warning(f"[WARN] 加载的特征数量 ({loaded_features.shape[0]}) 与当前锚点数量 ({gaussians.get_anchor.shape[0]}) 不一致！")
-            logger.warning("[WARN] 正在强制对齐维度...")
+            logger.warning(
+                f"[SEMANTIC] Feature count mismatch: cache={loaded_features.shape[0]}, "
+                f"anchors={gaussians.get_anchor.shape[0]}. Aligning to current anchor count."
+            )
             aligned_features = torch.zeros((gaussians.get_anchor.shape[0], loaded_features.shape[1]), device="cuda")
             min_len = min(loaded_features.shape[0], gaussians.get_anchor.shape[0])
             aligned_features[:min_len] = loaded_features[:min_len]
             gaussians.semantic_features = aligned_features
         else:
             gaussians.semantic_features = loaded_features
-            
-        logger.info(f"[SEMANTIC] 成功加载 {gaussians.semantic_features.shape[0]} 个语义特征。")
+
+        if os.path.exists(sem_conf_save_path):
+            loaded_confidence = torch.load(sem_conf_save_path, map_location="cuda")
+            if loaded_confidence.shape[0] != gaussians.get_anchor.shape[0]:
+                aligned_confidence = torch.zeros((gaussians.get_anchor.shape[0],), device="cuda")
+                min_len = min(loaded_confidence.shape[0], gaussians.get_anchor.shape[0])
+                aligned_confidence[:min_len] = loaded_confidence[:min_len]
+                gaussians.semantic_confidence = aligned_confidence
+            else:
+                gaussians.semantic_confidence = loaded_confidence
+        else:
+            logger.warning("[SEMANTIC] Missing confidence cache. Falling back to nonzero-feature confidence.")
+            gaussians.semantic_confidence = (gaussians.semantic_features.abs().sum(dim=1) > 0).float()
+
+        gaussians.semantic_valid_mask = gaussians.semantic_confidence > 0
+        logger.info(f"[SEMANTIC] Loaded semantic features for {gaussians.semantic_features.shape[0]} anchors.")
         torch.cuda.empty_cache()
 
-    # 情况 B: 文件不存在 -> 运行提取流程
     elif sam_checkpoint and os.path.exists(sam_checkpoint):
-        logger.info("\n[SEMANTIC] 未找到缓存特征，启动 2D-3D 语义特征提升 (CLIP Lifting)...")
-        # 提取真实生成的初始化锚点坐标
+        logger.info("[SEMANTIC] No cache found. Starting 2D-3D semantic lifting.")
         real_anchors = gaussians.get_anchor.detach()
-        logger.info(f"[SEMANTIC] 处理 {real_anchors.shape[0]} 个真实锚点...")
+        logger.info(f"[SEMANTIC] Lifting semantics for {real_anchors.shape[0]} anchors.")
         
-        # 调用语义投票逻辑
-        voter = SemanticVoter(dataset.source_path, sam_checkpoint, device="cuda")
-        anchor_features = voter.run(real_anchors)
+        voter = SemanticVoter(
+            dataset.source_path,
+            sam_checkpoint,
+            device="cuda",
+            boundary_kernel=getattr(opt, "semantic_boundary_kernel", 5),
+            min_interior_area=getattr(opt, "semantic_min_interior_pixels", 32),
+            min_views=getattr(opt, "semantic_min_views", 2),
+        )
+        semantic_result = voter.run(real_anchors)
         
-        # 绑定特征
-        gaussians.semantic_features = anchor_features.to("cuda")
+        gaussians.semantic_features = semantic_result["features"].to("cuda")
+        gaussians.semantic_confidence = semantic_result["confidence"].to("cuda")
+        gaussians.semantic_valid_mask = semantic_result["valid_mask"].to("cuda", dtype=torch.bool)
         
-        # 保存语义特征到磁盘
         torch.save(gaussians.semantic_features, sem_save_path)
-        logger.info(f"[SEMANTIC] 语义特征已保存至: {sem_save_path}")
+        torch.save(gaussians.semantic_confidence, sem_conf_save_path)
+        logger.info(f"[SEMANTIC] Saved semantic features to {sem_save_path}")
 
-        # 强制释放显存
-        del voter             
-        del anchor_features   
-        if 'real_anchors' in locals(): del real_anchors
-        torch.cuda.empty_cache() 
-        logger.info("[SEMANTIC] 已释放 SAM/CLIP 模型显存，准备开始训练。")
+        del voter
+        del semantic_result
+        if 'real_anchors' in locals():
+            del real_anchors
+        torch.cuda.empty_cache()
+        logger.info("[SEMANTIC] Released SAM/CLIP memory and continued to training.")
 
     else:
-        logger.info("\n[WARN] 未提供 --sam_checkpoint 且无缓存文件，跳过语义初始化。")
-        # 强制初始化空的语义特征，防止 anchor growing 时拼接引发维度崩溃
+        logger.info("[SEMANTIC] No SAM checkpoint and no cache found. Semantic initialization is skipped.")
         gaussians.semantic_features = torch.zeros((gaussians.get_anchor.shape[0], TARGET_SEMANTIC_DIM), device="cuda")
+        gaussians.semantic_confidence = torch.zeros((gaussians.get_anchor.shape[0],), device="cuda")
+        gaussians.semantic_valid_mask = torch.zeros((gaussians.get_anchor.shape[0],), device="cuda", dtype=torch.bool)
     # ===========================================================================================
 
     # [新增] 在获取完语义特征后，立刻执行 PCA 降维并导出可供外部软件查看的点云文件
@@ -303,6 +323,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gaussians.restore(model_params, opt)
     if not gaussians.semantic_routing_initialized:
         initialize_semantic_routing(gaussians, dataset, opt, logger)
+    if logger:
+        logger.info(
+            f"[SEMANTIC] Supervision starts at iter {get_semantic_supervision_start_iter(opt)} "
+            f"with confidence threshold {getattr(opt, 'semantic_confidence_threshold', 0.6):.2f}."
+        )
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -354,7 +379,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         Ll1 = l1_loss(image, gt_image)
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.001*scaling_reg
         semantic_loss = None
         semantic_weight = 0.0
         semantic_scale = get_semantic_loss_scale(iteration, opt)

@@ -158,6 +158,10 @@ class OptimizationParams(ParamGroup):
         self.semantic_loss_ramp_iters = 2_000
         self.semantic_sample_size = 4_096
         self.semantic_min_count = 64
+        self.semantic_confidence_threshold = 0.6
+        self.semantic_min_views = 2
+        self.semantic_boundary_kernel = 5
+        self.semantic_min_interior_pixels = 32
         self.semantic_cluster_seed = 42
         self.semantic_cluster_batch_size = 2_048
         self.semantic_missing_policy = "shared_fallback"
