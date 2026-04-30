@@ -598,14 +598,34 @@ def compute_triangle_branch_losses(render_pkg, gt_image, image_name, boundary_ma
         triangle_alpha.dtype,
         center_weight_cache,
     )
-    stable_target = edge_mask * center_weight
     losses = {}
+    gt_gray = rgb_to_grayscale(gt_image)
+    gt_grad = sobel_gradient_magnitude(gt_gray)
+    gt_edge_mask = (gt_grad > getattr(opt, "boundary_gt_grad_thresh", 0.08)).to(dtype=triangle_alpha.dtype)
 
-    if float(stable_target.sum().item()) > 0:
-        mask_residual = torch.abs(triangle_alpha - edge_mask) * stable_target
-        losses["mask"] = mask_residual.sum() / stable_target.sum().clamp_min(1e-6)
+    edge_core = edge_mask.clamp(0.0, 1.0)
+    band_kernel = max(1, int(getattr(opt, "triangle_mask_band_kernel", 3)))
+    if band_kernel % 2 == 0:
+        band_kernel += 1
+    if band_kernel > 1:
+        edge_band = F.max_pool2d(edge_core, kernel_size=band_kernel, stride=1, padding=band_kernel // 2)
+    else:
+        edge_band = edge_core
+    edge_ring = (edge_band - edge_core).clamp(0.0, 1.0)
+    soft_target = torch.clamp(
+        edge_core + float(getattr(opt, "triangle_mask_ring_weight", 0.35)) * edge_ring,
+        0.0,
+        1.0,
+    )
+    supervision_weight = edge_band * center_weight * gt_edge_mask
+    active_pixels = int((supervision_weight > 0).sum().item())
 
-        rgb_weight = stable_target * torch.clamp(triangle_alpha + edge_mask, 0.0, 1.0)
+    if active_pixels >= int(getattr(opt, "triangle_mask_min_pixels", getattr(opt, "boundary_min_pixels", 256))):
+        # Use GT edge gating plus a soft band target so slight projection offsets are not punished as full failures.
+        mask_residual = torch.abs(triangle_alpha - soft_target) * supervision_weight
+        losses["mask"] = mask_residual.sum() / supervision_weight.sum().clamp_min(1e-6)
+
+        rgb_weight = supervision_weight * torch.clamp(triangle_alpha + soft_target, 0.0, 1.0)
         rgb_residual = torch.abs(render_pkg["render"] - gt_image) * rgb_weight
         losses["edge_rgb"] = rgb_residual.sum() / (rgb_weight.sum().clamp_min(1e-6) * gt_image.shape[0])
 

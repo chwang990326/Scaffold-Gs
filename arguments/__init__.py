@@ -193,6 +193,9 @@ class OptimizationParams(ParamGroup):
         self.triangle_thickness_max = 6.0
         self.triangle_depth_temperature = 0.25
         self.triangle_render_sharpness = 6.0
+        self.triangle_mask_band_kernel = 3
+        self.triangle_mask_ring_weight = 0.35
+        self.triangle_mask_min_pixels = 256
         self.triangle_ctrl_lr_init = 0.0005
         self.triangle_ctrl_lr_final = 0.00005
         self.triangle_ctrl_lr_delay_mult = 0.01
