@@ -177,6 +177,37 @@ class OptimizationParams(ParamGroup):
         self.boundary_center_min_overlap_ratio = 0.30
         self.boundary_gt_grad_thresh = 0.08
         self.boundary_min_pixels = 256
+        self.triangle_feature_dim = 128
+        self.triangle_init_start_iter = -1
+        self.triangle_only_iters = 1_000
+        self.triangle_ramp_iters = 1_000
+        self.triangle_confidence_threshold = 0.55
+        self.triangle_min_views = 2
+        self.triangle_max_candidates = 1_024
+        self.triangle_render_max_per_view = 256
+        self.triangle_neighbor_k = 8
+        self.triangle_init_scale = 1.0
+        self.triangle_init_alpha = 0.35
+        self.triangle_init_thickness = 2.0
+        self.triangle_thickness_min = 1.0
+        self.triangle_thickness_max = 6.0
+        self.triangle_depth_temperature = 0.25
+        self.triangle_render_sharpness = 6.0
+        self.triangle_ctrl_lr_init = 0.0005
+        self.triangle_ctrl_lr_final = 0.00005
+        self.triangle_ctrl_lr_delay_mult = 0.01
+        self.triangle_ctrl_lr_max_steps = 30_000
+        self.triangle_alpha_lr = 0.0005
+        self.triangle_thickness_lr = 0.0005
+        self.triangle_color_lr = 0.001
+        self.triangle_semantic_lr = 0.0005
+        self.triangle_loss_weight_mask = 0.02
+        self.triangle_loss_weight_edge_rgb = 0.01
+        self.triangle_loss_weight_sem = 0.005
+        self.triangle_loss_weight_mv = 0.002
+        self.triangle_loss_weight_depth = 0.002
+        self.triangle_loss_weight_reg = 0.001
+        self.triangle_log_interval = 50
 
         super().__init__(parser, "Optimization Parameters")
 

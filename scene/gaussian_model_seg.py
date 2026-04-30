@@ -90,6 +90,30 @@ class GaussianModel:
         self.semantic_routing_initialized = False
         self.semantic_adapter = None
         self.semantic_adapter_scheduler_args = None
+        self._triangle_ctrl = nn.Parameter(torch.empty((0, 3, 3), device="cuda").requires_grad_(True))
+        self._triangle_alpha_logit = nn.Parameter(torch.empty((0, 1), device="cuda").requires_grad_(True))
+        self._triangle_thickness_logit = nn.Parameter(torch.empty((0, 1), device="cuda").requires_grad_(True))
+        self._triangle_rgb_residual = nn.Parameter(torch.empty((0, 3), device="cuda").requires_grad_(True))
+        self._triangle_semantic_feat = nn.Parameter(torch.empty((0, 128), device="cuda").requires_grad_(True))
+        self._triangle_semantic_target = torch.empty((0, 128), device="cuda")
+        self._triangle_parent_anchor_idx = torch.empty((0,), device="cuda", dtype=torch.long)
+        self._triangle_confidence = torch.empty((0,), device="cuda", dtype=torch.float32)
+        self._triangle_active_mask = torch.empty((0,), device="cuda", dtype=torch.bool)
+        self._triangle_init_ctrl = torch.empty((0, 3, 3), device="cuda")
+        self._triangle_target_center = torch.empty((0, 3), device="cuda")
+        self._triangle_view_count = torch.empty((0,), device="cuda", dtype=torch.float32)
+        self._triangle_angle_stability = torch.empty((0,), device="cuda", dtype=torch.float32)
+        self._triangle_depth_stability = torch.empty((0,), device="cuda", dtype=torch.float32)
+        self._triangle_center_weight = torch.empty((0,), device="cuda", dtype=torch.float32)
+        self.triangle_initialized = False
+        self.triangle_semantic_dim = 128
+        self.triangle_thickness_min = 1.0
+        self.triangle_thickness_max = 6.0
+        self.triangle_ctrl_scheduler_args = None
+        self.triangle_alpha_scheduler_args = None
+        self.triangle_thickness_scheduler_args = None
+        self.triangle_color_scheduler_args = None
+        self.triangle_semantic_scheduler_args = None
         
         self.opacity_accum = torch.empty(0)
 
@@ -292,6 +316,352 @@ class GaussianModel:
             return torch.empty((0, 3 * self.n_offsets), device=color_input.device, dtype=color_input.dtype)
         return self.mlp_color_fallback(color_input)
 
+    def reset_triangle_state(self, semantic_dim=None):
+        if semantic_dim is None:
+            semantic_dim = self.triangle_semantic_dim
+        semantic_dim = max(1, int(semantic_dim))
+        self.triangle_semantic_dim = semantic_dim
+        self._triangle_ctrl = nn.Parameter(torch.empty((0, 3, 3), device="cuda").requires_grad_(True))
+        self._triangle_alpha_logit = nn.Parameter(torch.empty((0, 1), device="cuda").requires_grad_(True))
+        self._triangle_thickness_logit = nn.Parameter(torch.empty((0, 1), device="cuda").requires_grad_(True))
+        self._triangle_rgb_residual = nn.Parameter(torch.empty((0, 3), device="cuda").requires_grad_(True))
+        self._triangle_semantic_feat = nn.Parameter(torch.empty((0, semantic_dim), device="cuda").requires_grad_(True))
+        self._triangle_semantic_target = torch.empty((0, semantic_dim), device="cuda")
+        self._triangle_parent_anchor_idx = torch.empty((0,), device="cuda", dtype=torch.long)
+        self._triangle_confidence = torch.empty((0,), device="cuda", dtype=torch.float32)
+        self._triangle_active_mask = torch.empty((0,), device="cuda", dtype=torch.bool)
+        self._triangle_init_ctrl = torch.empty((0, 3, 3), device="cuda")
+        self._triangle_target_center = torch.empty((0, 3), device="cuda")
+        self._triangle_view_count = torch.empty((0,), device="cuda", dtype=torch.float32)
+        self._triangle_angle_stability = torch.empty((0,), device="cuda", dtype=torch.float32)
+        self._triangle_depth_stability = torch.empty((0,), device="cuda", dtype=torch.float32)
+        self._triangle_center_weight = torch.empty((0,), device="cuda", dtype=torch.float32)
+        self.triangle_initialized = False
+
+    @property
+    def has_boundary_triangles(self):
+        if self._triangle_ctrl.dim() != 3 or self._triangle_ctrl.shape[0] == 0:
+            return False
+        if self._triangle_active_mask.dim() != 1 or self._triangle_active_mask.shape[0] != self._triangle_ctrl.shape[0]:
+            return False
+        return bool(self._triangle_active_mask.any().item())
+
+    def set_triangle_hyperparams(self, training_args):
+        self.triangle_thickness_min = float(getattr(training_args, "triangle_thickness_min", 1.0))
+        self.triangle_thickness_max = max(
+            self.triangle_thickness_min + 1e-3,
+            float(getattr(training_args, "triangle_thickness_max", 6.0)),
+        )
+        self.triangle_semantic_dim = max(
+            1,
+            int(getattr(training_args, "triangle_feature_dim", self.triangle_semantic_dim)),
+        )
+
+    def get_triangle_alpha(self):
+        return torch.sigmoid(self._triangle_alpha_logit)
+
+    def get_triangle_thickness(self):
+        if self._triangle_thickness_logit.shape[0] == 0:
+            return torch.empty((0, 1), device="cuda")
+        return self.triangle_thickness_min + (
+            self.triangle_thickness_max - self.triangle_thickness_min
+        ) * torch.sigmoid(self._triangle_thickness_logit)
+
+    def get_active_triangle_state(self, visible_mask=None):
+        if not self.has_boundary_triangles:
+            return None
+
+        active_mask = self._triangle_active_mask.clone()
+        if (
+            visible_mask is not None and
+            visible_mask.dim() == 1 and
+            self._triangle_parent_anchor_idx.shape[0] == active_mask.shape[0] and
+            visible_mask.shape[0] == self.get_anchor.shape[0]
+        ):
+            active_mask &= visible_mask[self._triangle_parent_anchor_idx]
+
+        if not active_mask.any():
+            return None
+
+        return {
+            "ctrl": self._triangle_ctrl[active_mask],
+            "alpha": self.get_triangle_alpha()[active_mask],
+            "thickness": self.get_triangle_thickness()[active_mask],
+            "rgb_residual": self._triangle_rgb_residual[active_mask],
+            "semantic_feat": self._triangle_semantic_feat[active_mask],
+            "semantic_target": self._triangle_semantic_target[active_mask],
+            "parent_anchor_idx": self._triangle_parent_anchor_idx[active_mask],
+            "confidence": self._triangle_confidence[active_mask],
+            "target_center": self._triangle_target_center[active_mask],
+            "init_ctrl": self._triangle_init_ctrl[active_mask],
+            "view_count": self._triangle_view_count[active_mask],
+            "angle_stability": self._triangle_angle_stability[active_mask],
+            "depth_stability": self._triangle_depth_stability[active_mask],
+            "center_weight": self._triangle_center_weight[active_mask],
+            "active_mask": active_mask,
+        }
+
+    def get_triangle_state(self):
+        return {
+            "triangle_ctrl": self._triangle_ctrl.detach(),
+            "triangle_alpha_logit": self._triangle_alpha_logit.detach(),
+            "triangle_thickness_logit": self._triangle_thickness_logit.detach(),
+            "triangle_rgb_residual": self._triangle_rgb_residual.detach(),
+            "triangle_semantic_feat": self._triangle_semantic_feat.detach(),
+            "triangle_semantic_target": self._triangle_semantic_target.detach(),
+            "triangle_parent_anchor_idx": self._triangle_parent_anchor_idx.detach(),
+            "triangle_confidence": self._triangle_confidence.detach(),
+            "triangle_active_mask": self._triangle_active_mask.detach(),
+            "triangle_init_ctrl": self._triangle_init_ctrl.detach(),
+            "triangle_target_center": self._triangle_target_center.detach(),
+            "triangle_view_count": self._triangle_view_count.detach(),
+            "triangle_angle_stability": self._triangle_angle_stability.detach(),
+            "triangle_depth_stability": self._triangle_depth_stability.detach(),
+            "triangle_center_weight": self._triangle_center_weight.detach(),
+            "triangle_semantic_dim": self.triangle_semantic_dim,
+            "triangle_initialized": self.triangle_initialized,
+            "triangle_thickness_min": self.triangle_thickness_min,
+            "triangle_thickness_max": self.triangle_thickness_max,
+        }
+
+    def load_triangle_state(self, triangle_state):
+        if triangle_state is None:
+            self.reset_triangle_state(self.triangle_semantic_dim)
+            return
+
+        semantic_feat = triangle_state.get("triangle_semantic_feat")
+        semantic_dim = semantic_feat.shape[1] if semantic_feat is not None and semantic_feat.dim() == 2 else triangle_state.get("triangle_semantic_dim", self.triangle_semantic_dim)
+        self.reset_triangle_state(semantic_dim)
+        self.triangle_thickness_min = float(triangle_state.get("triangle_thickness_min", self.triangle_thickness_min))
+        self.triangle_thickness_max = float(triangle_state.get("triangle_thickness_max", self.triangle_thickness_max))
+
+        self._triangle_ctrl = nn.Parameter(triangle_state.get("triangle_ctrl", self._triangle_ctrl).detach().to(device="cuda", dtype=torch.float32).requires_grad_(True))
+        self._triangle_alpha_logit = nn.Parameter(triangle_state.get("triangle_alpha_logit", self._triangle_alpha_logit).detach().to(device="cuda", dtype=torch.float32).requires_grad_(True))
+        self._triangle_thickness_logit = nn.Parameter(triangle_state.get("triangle_thickness_logit", self._triangle_thickness_logit).detach().to(device="cuda", dtype=torch.float32).requires_grad_(True))
+        self._triangle_rgb_residual = nn.Parameter(triangle_state.get("triangle_rgb_residual", self._triangle_rgb_residual).detach().to(device="cuda", dtype=torch.float32).requires_grad_(True))
+        self._triangle_semantic_feat = nn.Parameter(triangle_state.get("triangle_semantic_feat", self._triangle_semantic_feat).detach().to(device="cuda", dtype=torch.float32).requires_grad_(True))
+        self._triangle_semantic_target = triangle_state.get("triangle_semantic_target", self._triangle_semantic_target).detach().to(device="cuda", dtype=torch.float32)
+        self._triangle_parent_anchor_idx = triangle_state.get("triangle_parent_anchor_idx", self._triangle_parent_anchor_idx).detach().to(device="cuda", dtype=torch.long)
+        self._triangle_confidence = triangle_state.get("triangle_confidence", self._triangle_confidence).detach().to(device="cuda", dtype=torch.float32)
+        self._triangle_active_mask = triangle_state.get("triangle_active_mask", self._triangle_active_mask).detach().to(device="cuda", dtype=torch.bool)
+        self._triangle_init_ctrl = triangle_state.get("triangle_init_ctrl", self._triangle_init_ctrl).detach().to(device="cuda", dtype=torch.float32)
+        self._triangle_target_center = triangle_state.get("triangle_target_center", self._triangle_target_center).detach().to(device="cuda", dtype=torch.float32)
+        self._triangle_view_count = triangle_state.get("triangle_view_count", self._triangle_view_count).detach().to(device="cuda", dtype=torch.float32)
+        self._triangle_angle_stability = triangle_state.get("triangle_angle_stability", self._triangle_angle_stability).detach().to(device="cuda", dtype=torch.float32)
+        self._triangle_depth_stability = triangle_state.get("triangle_depth_stability", self._triangle_depth_stability).detach().to(device="cuda", dtype=torch.float32)
+        self._triangle_center_weight = triangle_state.get("triangle_center_weight", self._triangle_center_weight).detach().to(device="cuda", dtype=torch.float32)
+        self.triangle_initialized = bool(triangle_state.get("triangle_initialized", self._triangle_ctrl.shape[0] > 0))
+
+    def initialize_boundary_triangles(self, boundary_candidates, training_args, logger=None):
+        self.set_triangle_hyperparams(training_args)
+        if boundary_candidates is None:
+            self.reset_triangle_state(self.triangle_semantic_dim)
+            self.triangle_initialized = True
+            if logger is not None:
+                logger.info("[TRIANGLE] Boundary candidate cache is empty. Triangle branch stays inactive.")
+            return 0
+
+        parent_anchor_indices = boundary_candidates.get("parent_anchor_indices")
+        if parent_anchor_indices is None or parent_anchor_indices.numel() == 0:
+            self.reset_triangle_state(self.triangle_semantic_dim)
+            self.triangle_initialized = True
+            if logger is not None:
+                logger.info("[TRIANGLE] No valid boundary candidates passed the confidence filter.")
+            return 0
+
+        parent_anchor_indices = parent_anchor_indices.to(device="cuda", dtype=torch.long)
+        valid_mask = (parent_anchor_indices >= 0) & (parent_anchor_indices < self.get_anchor.shape[0])
+        confidence = boundary_candidates.get("confidence", torch.zeros_like(parent_anchor_indices, dtype=torch.float32)).to(device="cuda", dtype=torch.float32)
+        view_count = boundary_candidates.get("view_counts", torch.zeros_like(confidence)).to(device="cuda", dtype=torch.float32)
+        valid_mask &= confidence >= float(getattr(training_args, "triangle_confidence_threshold", 0.55))
+        valid_mask &= view_count >= float(getattr(training_args, "triangle_min_views", 2))
+
+        if not valid_mask.any():
+            self.reset_triangle_state(self.triangle_semantic_dim)
+            self.triangle_initialized = True
+            if logger is not None:
+                logger.info("[TRIANGLE] Boundary candidates exist, but none satisfy the triangle activation rule.")
+            return 0
+
+        raw_positions = boundary_candidates.get("positions")
+        if raw_positions is None:
+            raw_positions = self.get_anchor[parent_anchor_indices]
+        raw_semantic_features = boundary_candidates.get("semantic_features")
+        if raw_semantic_features is None:
+            raw_semantic_features = torch.zeros((parent_anchor_indices.shape[0], self.triangle_semantic_dim), device="cuda")
+        raw_angle_stability = boundary_candidates.get("angle_stability")
+        if raw_angle_stability is None:
+            raw_angle_stability = torch.ones_like(confidence)
+        raw_depth_stability = boundary_candidates.get("depth_stability")
+        if raw_depth_stability is None:
+            raw_depth_stability = torch.ones_like(confidence)
+        raw_center_weight = boundary_candidates.get("center_weight")
+        if raw_center_weight is None:
+            raw_center_weight = torch.ones_like(confidence)
+
+        parent_anchor_indices = parent_anchor_indices[valid_mask]
+        confidence = confidence[valid_mask]
+        view_count = view_count[valid_mask]
+        positions = raw_positions.to(device="cuda", dtype=torch.float32)[valid_mask]
+        semantic_features = raw_semantic_features.to(device="cuda", dtype=torch.float32)[valid_mask]
+        angle_stability = raw_angle_stability.to(device="cuda", dtype=torch.float32)[valid_mask]
+        depth_stability = raw_depth_stability.to(device="cuda", dtype=torch.float32)[valid_mask]
+        center_weight = raw_center_weight.to(device="cuda", dtype=torch.float32)[valid_mask]
+
+        max_candidates = int(getattr(training_args, "triangle_max_candidates", 0))
+        if max_candidates > 0 and parent_anchor_indices.numel() > max_candidates:
+            topk = torch.topk(confidence, k=max_candidates, largest=True).indices
+            parent_anchor_indices = parent_anchor_indices[topk]
+            confidence = confidence[topk]
+            view_count = view_count[topk]
+            positions = positions[topk]
+            semantic_features = semantic_features[topk]
+            angle_stability = angle_stability[topk]
+            depth_stability = depth_stability[topk]
+            center_weight = center_weight[topk]
+
+        semantic_dim = semantic_features.shape[1] if semantic_features.dim() == 2 and semantic_features.shape[1] > 0 else self.triangle_semantic_dim
+        self.reset_triangle_state(semantic_dim)
+        self.set_triangle_hyperparams(training_args)
+
+        parent_scaling = self.get_scaling[parent_anchor_indices, :3]
+        parent_offsets = self._offset[parent_anchor_indices] * parent_scaling.unsqueeze(1)
+        dir_a = parent_offsets[:, 0, :]
+        dir_b = parent_offsets[:, min(1, self.n_offsets - 1), :]
+
+        fallback_a = torch.tensor([1.0, 0.0, 0.0], device="cuda").expand_as(dir_a)
+        fallback_b = torch.tensor([0.0, 1.0, 0.0], device="cuda").expand_as(dir_b)
+        dir_a_norm = dir_a.norm(dim=-1, keepdim=True)
+        dir_a = torch.where(dir_a_norm > 1e-6, dir_a / dir_a_norm.clamp_min(1e-6), fallback_a)
+        dir_b = dir_b - (dir_b * dir_a).sum(dim=-1, keepdim=True) * dir_a
+        dir_b_norm = dir_b.norm(dim=-1, keepdim=True)
+        dir_b = torch.where(dir_b_norm > 1e-6, dir_b / dir_b_norm.clamp_min(1e-6), fallback_b)
+
+        base_scale = parent_scaling.mean(dim=-1, keepdim=True).clamp_min(max(self.voxel_size, 1e-4) * 0.25)
+        base_scale = base_scale * float(getattr(training_args, "triangle_init_scale", 1.0))
+
+        ctrl = torch.stack([
+            positions + base_scale * dir_a,
+            positions - base_scale * dir_a,
+            positions + base_scale * dir_b,
+        ], dim=1)
+
+        alpha_init = torch.clamp(
+            confidence.unsqueeze(1) * float(getattr(training_args, "triangle_init_alpha", 0.35)),
+            1e-3,
+            0.95,
+        )
+        thickness_value = float(getattr(training_args, "triangle_init_thickness", 2.0))
+        thickness_norm = (thickness_value - self.triangle_thickness_min) / max(self.triangle_thickness_max - self.triangle_thickness_min, 1e-6)
+        thickness_norm = min(max(thickness_norm, 1e-3), 1.0 - 1e-3)
+        thickness_logit = inverse_sigmoid(torch.full((ctrl.shape[0], 1), thickness_norm, device="cuda"))
+
+        self._triangle_ctrl = nn.Parameter(ctrl.detach().requires_grad_(True))
+        self._triangle_alpha_logit = nn.Parameter(inverse_sigmoid(alpha_init).detach().requires_grad_(True))
+        self._triangle_thickness_logit = nn.Parameter(thickness_logit.detach().requires_grad_(True))
+        self._triangle_rgb_residual = nn.Parameter(torch.zeros((ctrl.shape[0], 3), device="cuda").requires_grad_(True))
+        self._triangle_semantic_feat = nn.Parameter(semantic_features.detach().clone().requires_grad_(True))
+        self._triangle_semantic_target = semantic_features.detach().clone()
+        self._triangle_parent_anchor_idx = parent_anchor_indices.detach().clone()
+        self._triangle_confidence = confidence.detach().clone()
+        self._triangle_active_mask = torch.ones((ctrl.shape[0],), device="cuda", dtype=torch.bool)
+        self._triangle_init_ctrl = ctrl.detach().clone()
+        self._triangle_target_center = positions.detach().clone()
+        self._triangle_view_count = view_count.detach().clone()
+        self._triangle_angle_stability = angle_stability.detach().clone()
+        self._triangle_depth_stability = depth_stability.detach().clone()
+        self._triangle_center_weight = center_weight.detach().clone()
+        self.triangle_initialized = True
+
+        if logger is not None:
+            logger.info(
+                f"[TRIANGLE] Initialized {ctrl.shape[0]} sparse boundary triangles "
+                f"(semantic_dim={self.triangle_semantic_dim})."
+            )
+        return ctrl.shape[0]
+
+    def set_main_branch_trainable(self, trainable=True):
+        main_params = [
+            self._anchor,
+            self._offset,
+            self._anchor_feat,
+            self._anchor_sem_feat,
+            self._opacity,
+            self._scaling,
+            self._rotation,
+        ]
+        for param in main_params:
+            param.requires_grad_(trainable)
+        for module in [self.mlp_opacity, self.mlp_cov, self.mlp_color_fallback]:
+            for param in module.parameters():
+                param.requires_grad_(trainable)
+        if self.semantic_adapter is not None:
+            for param in self.semantic_adapter.parameters():
+                param.requires_grad_(trainable)
+        if self.appearance_dim > 0 and self.embedding_appearance is not None:
+            for param in self.embedding_appearance.parameters():
+                param.requires_grad_(trainable)
+        if self.use_feat_bank:
+            for param in self.mlp_feature_bank.parameters():
+                param.requires_grad_(trainable)
+
+    def set_triangle_branch_trainable(self, trainable=True):
+        for param in [
+            self._triangle_ctrl,
+            self._triangle_alpha_logit,
+            self._triangle_thickness_logit,
+            self._triangle_rgb_residual,
+            self._triangle_semantic_feat,
+        ]:
+            param.requires_grad_(trainable)
+
+    def _configure_triangle_scheduler_args(self, training_args):
+        self.set_triangle_hyperparams(training_args)
+        self.triangle_ctrl_scheduler_args = get_expon_lr_func(
+            lr_init=getattr(training_args, "triangle_ctrl_lr_init", 0.0005),
+            lr_final=getattr(training_args, "triangle_ctrl_lr_final", 0.00005),
+            lr_delay_mult=getattr(training_args, "triangle_ctrl_lr_delay_mult", 0.01),
+            max_steps=getattr(training_args, "triangle_ctrl_lr_max_steps", getattr(training_args, "iterations", 30000)),
+        )
+        self.triangle_alpha_scheduler_args = get_expon_lr_func(
+            lr_init=getattr(training_args, "triangle_alpha_lr", 0.0005),
+            lr_final=getattr(training_args, "triangle_alpha_lr", 0.0005),
+            max_steps=getattr(training_args, "triangle_ctrl_lr_max_steps", getattr(training_args, "iterations", 30000)),
+        )
+        self.triangle_thickness_scheduler_args = get_expon_lr_func(
+            lr_init=getattr(training_args, "triangle_thickness_lr", 0.0005),
+            lr_final=getattr(training_args, "triangle_thickness_lr", 0.0005),
+            max_steps=getattr(training_args, "triangle_ctrl_lr_max_steps", getattr(training_args, "iterations", 30000)),
+        )
+        self.triangle_color_scheduler_args = get_expon_lr_func(
+            lr_init=getattr(training_args, "triangle_color_lr", 0.001),
+            lr_final=getattr(training_args, "triangle_color_lr", 0.001),
+            max_steps=getattr(training_args, "triangle_ctrl_lr_max_steps", getattr(training_args, "iterations", 30000)),
+        )
+        self.triangle_semantic_scheduler_args = get_expon_lr_func(
+            lr_init=getattr(training_args, "triangle_semantic_lr", 0.0005),
+            lr_final=getattr(training_args, "triangle_semantic_lr", 0.0005),
+            max_steps=getattr(training_args, "triangle_ctrl_lr_max_steps", getattr(training_args, "iterations", 30000)),
+        )
+
+    def add_triangle_optimizer_groups(self, training_args):
+        if self.optimizer is None or self._triangle_ctrl.shape[0] == 0:
+            return
+
+        existing_names = {group.get("name") for group in self.optimizer.param_groups}
+        self._configure_triangle_scheduler_args(training_args)
+        triangle_groups = [
+            ("triangle_ctrl", [self._triangle_ctrl], getattr(training_args, "triangle_ctrl_lr_init", 0.0005)),
+            ("triangle_alpha", [self._triangle_alpha_logit], getattr(training_args, "triangle_alpha_lr", 0.0005)),
+            ("triangle_thickness", [self._triangle_thickness_logit], getattr(training_args, "triangle_thickness_lr", 0.0005)),
+            ("triangle_rgb", [self._triangle_rgb_residual], getattr(training_args, "triangle_color_lr", 0.001)),
+            ("triangle_semantic", [self._triangle_semantic_feat], getattr(training_args, "triangle_semantic_lr", 0.0005)),
+        ]
+        for name, params, lr in triangle_groups:
+            if name in existing_names:
+                continue
+            self.optimizer.add_param_group({"params": params, "lr": lr, "name": name})
+
     def get_module_state(self):
         module_state = {
             "mlp_opacity": self.mlp_opacity.state_dict(),
@@ -363,6 +733,7 @@ class GaussianModel:
             self.get_module_state(),
             self._anchor_sem_feat,
             self._semantic_confidence,
+            self.get_triangle_state(),
         )
 
     def _build_aligned_semantic_features(self, num_anchors: int, source_features=None):
@@ -399,6 +770,7 @@ class GaussianModel:
         semantic_adapter_state = None
         routing_state = None
         module_state = None
+        triangle_state = None
         previous_semantic = self._semantic_features if self._semantic_features.dim() == 2 else None
         previous_semantic_confidence = self._semantic_confidence if self._semantic_confidence.dim() == 1 else None
         previous_anchor_sem_feat = self._anchor_sem_feat if self._anchor_sem_feat.dim() == 2 else None
@@ -427,6 +799,8 @@ class GaussianModel:
                 anchor_sem_feat = model_args[14]
             if len(model_args) >= 16:
                 semantic_confidence = model_args[15]
+            if len(model_args) >= 17:
+                triangle_state = model_args[16]
         elif len(model_args) == 11:
             (self._anchor, 
             self._offset,
@@ -474,6 +848,7 @@ class GaussianModel:
 
         self.load_semantic_routing_state(routing_state)
         self.load_module_state(module_state)
+        self.load_triangle_state(triangle_state)
         self.training_setup(training_args)
         self.offset_denom = offset_denom
         self._load_optimizer_state_compat(opt_dict)
@@ -574,6 +949,7 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.set_triangle_hyperparams(training_args)
         if self._anchor_sem_feat.dim() != 2 or self._anchor_sem_feat.shape[0] != self.get_anchor.shape[0]:
             self._anchor_sem_feat = self._build_aligned_anchor_sem_feat(self.get_anchor.shape[0], self._anchor_sem_feat)
         if self._semantic_confidence.dim() != 1 or self._semantic_confidence.shape[0] != self.get_anchor.shape[0]:
@@ -604,6 +980,15 @@ class GaussianModel:
         if self.semantic_adapter is not None:
             l.append({'params': self.semantic_adapter.parameters(), 'lr': training_args.semantic_adapter_lr, "name": "semantic_adapter"})
         l.append({'params': [self._anchor_sem_feat], 'lr': training_args.feature_lr, "name": "anchor_sem_feat"})
+        if self._triangle_ctrl.shape[0] > 0:
+            self._configure_triangle_scheduler_args(training_args)
+            l.extend([
+                {'params': [self._triangle_ctrl], 'lr': training_args.triangle_ctrl_lr_init, "name": "triangle_ctrl"},
+                {'params': [self._triangle_alpha_logit], 'lr': training_args.triangle_alpha_lr, "name": "triangle_alpha"},
+                {'params': [self._triangle_thickness_logit], 'lr': training_args.triangle_thickness_lr, "name": "triangle_thickness"},
+                {'params': [self._triangle_rgb_residual], 'lr': training_args.triangle_color_lr, "name": "triangle_rgb"},
+                {'params': [self._triangle_semantic_feat], 'lr': training_args.triangle_semantic_lr, "name": "triangle_semantic"},
+            ])
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -640,6 +1025,8 @@ class GaussianModel:
             self.semantic_adapter_scheduler_args = get_expon_lr_func(lr_init=training_args.semantic_adapter_lr,
                                                                     lr_final=training_args.semantic_adapter_lr,
                                                                     max_steps=training_args.position_lr_max_steps)
+        if self._triangle_ctrl.shape[0] > 0 and self.triangle_ctrl_scheduler_args is None:
+            self._configure_triangle_scheduler_args(training_args)
 
     def update_learning_rate(self, iteration):
         for param_group in self.optimizer.param_groups:
@@ -659,6 +1046,16 @@ class GaussianModel:
                 param_group['lr'] = self.appearance_scheduler_args(iteration)
             if self.semantic_adapter is not None and param_group["name"] == "semantic_adapter":
                 param_group['lr'] = self.semantic_adapter_scheduler_args(iteration)
+            if self._triangle_ctrl.shape[0] > 0 and param_group["name"] == "triangle_ctrl":
+                param_group['lr'] = self.triangle_ctrl_scheduler_args(iteration)
+            if self._triangle_ctrl.shape[0] > 0 and param_group["name"] == "triangle_alpha":
+                param_group['lr'] = self.triangle_alpha_scheduler_args(iteration)
+            if self._triangle_ctrl.shape[0] > 0 and param_group["name"] == "triangle_thickness":
+                param_group['lr'] = self.triangle_thickness_scheduler_args(iteration)
+            if self._triangle_ctrl.shape[0] > 0 and param_group["name"] == "triangle_rgb":
+                param_group['lr'] = self.triangle_color_scheduler_args(iteration)
+            if self._triangle_ctrl.shape[0] > 0 and param_group["name"] == "triangle_semantic":
+                param_group['lr'] = self.triangle_semantic_scheduler_args(iteration)
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -987,11 +1384,13 @@ class GaussianModel:
                 self.embedding_appearance.eval()
                 torch.jit.trace(self.embedding_appearance, torch.zeros((1,), dtype=torch.long).cuda()).save(os.path.join(path, 'embedding_appearance.pt'))
                 self.embedding_appearance.train()
+            torch.save(self.get_triangle_state(), os.path.join(path, 'triangle_state.pth'))
         elif mode == 'unite':
             data = {
                 'opacity_mlp': self.mlp_opacity.state_dict(),
                 'cov_mlp': self.mlp_cov.state_dict(),
                 'color_mlp': self.mlp_color_fallback.state_dict(),
+                'triangle_state': self.get_triangle_state(),
             }
             if self.use_feat_bank: data['feature_bank_mlp'] = self.mlp_feature_bank.state_dict()
             if self.appearance_dim > 0: data['appearance'] = self.embedding_appearance.state_dict()
@@ -1011,11 +1410,17 @@ class GaussianModel:
                 raise FileNotFoundError(f"Neither {shared_color_path} nor {fallback_path} exists.")
 
             self.load_semantic_routing_state(None)
+            triangle_state_path = os.path.join(path, 'triangle_state.pth')
+            if os.path.exists(triangle_state_path):
+                self.load_triangle_state(torch.load(triangle_state_path, map_location='cuda'))
+            else:
+                self.reset_triangle_state(self.triangle_semantic_dim)
             if self.use_feat_bank: self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0: self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
         elif mode == 'unite':
             ckpt = torch.load(os.path.join(path, 'checkpoints.pth'))
             self.load_module_state(ckpt)
             self.load_semantic_routing_state(None)
+            self.load_triangle_state(ckpt.get('triangle_state'))
             if self.use_feat_bank: self.mlp_feature_bank.load_state_dict(ckpt['feature_bank_mlp'])
             if self.appearance_dim > 0: self.embedding_appearance.load_state_dict(ckpt['appearance'])

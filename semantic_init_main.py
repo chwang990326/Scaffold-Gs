@@ -289,8 +289,12 @@ class SemanticVoter:
         boundary_mask_min_area_ratio=0.005,
         boundary_mask_max_area_ratio=0.20,
         boundary_border_ignore_ratio=0.10,
+        boundary_center_inner_ratio=0.25,
         boundary_center_outer_ratio=0.15,
         boundary_center_min_overlap_ratio=0.30,
+        boundary_candidate_confidence_threshold=0.55,
+        boundary_candidate_max_count=1024,
+        target_feature_dim=128,
     ):
         self.device = device
         self.scene_path = scene_path
@@ -307,8 +311,12 @@ class SemanticVoter:
         self.boundary_mask_min_area_ratio = float(boundary_mask_min_area_ratio)
         self.boundary_mask_max_area_ratio = float(boundary_mask_max_area_ratio)
         self.boundary_border_ignore_ratio = float(boundary_border_ignore_ratio)
+        self.boundary_center_inner_ratio = float(boundary_center_inner_ratio)
         self.boundary_center_outer_ratio = float(boundary_center_outer_ratio)
         self.boundary_center_min_overlap_ratio = float(boundary_center_min_overlap_ratio)
+        self.boundary_candidate_confidence_threshold = float(boundary_candidate_confidence_threshold)
+        self.boundary_candidate_max_count = max(0, int(boundary_candidate_max_count))
+        self.target_feature_dim = max(1, int(target_feature_dim))
         
         # [???] ?????? 2D ?????????????????
         self.mask_out_dir = os.path.join(scene_path, "semantic_masks_2d")
@@ -410,6 +418,37 @@ class SemanticVoter:
         edge_path = os.path.join(self.edge_mask_out_dir, f"{image_stem}_edge.png")
         cv2.imwrite(edge_path, (edge_mask * 255).astype(np.uint8))
 
+    def _build_center_weight_map(self, height, width):
+        x_coords = np.linspace(0.0, 1.0, num=width, dtype=np.float32)
+        y_coords = np.linspace(0.0, 1.0, num=height, dtype=np.float32)
+
+        inner_margin = min(max(self.boundary_center_inner_ratio, 0.0), 0.49)
+        outer_margin = min(max(self.boundary_center_outer_ratio, 0.0), 0.49)
+        if outer_margin > inner_margin:
+            outer_margin, inner_margin = inner_margin, outer_margin
+
+        def axis_weights(coords):
+            weights = np.zeros_like(coords)
+            inner_left = inner_margin
+            inner_right = 1.0 - inner_margin
+            outer_left = outer_margin
+            outer_right = 1.0 - outer_margin
+
+            inner_mask = (coords >= inner_left) & (coords <= inner_right)
+            weights[inner_mask] = 1.0
+
+            if inner_left > outer_left:
+                left_mask = (coords >= outer_left) & (coords < inner_left)
+                weights[left_mask] = (coords[left_mask] - outer_left) / max(inner_left - outer_left, 1e-6)
+
+                right_mask = (coords > inner_right) & (coords <= outer_right)
+                weights[right_mask] = (outer_right - coords[right_mask]) / max(outer_right - inner_right, 1e-6)
+            return weights
+
+        x_weights = axis_weights(x_coords)
+        y_weights = axis_weights(y_coords)
+        return torch.from_numpy(y_weights[:, None] * x_weights[None, :]).to(self.device)
+
     def _process_view(self, colmap_img, compute_clip_features=True):
         full_img_path = self._resolve_image_path(colmap_img.name)
         if full_img_path is None:
@@ -425,8 +464,9 @@ class SemanticVoter:
         self._save_semantic_visualization(id_map, colmap_img.name)
         stable_edge_mask = self._build_stable_edge_mask(mask_infos, h, w)
         self._save_stable_edge_mask(stable_edge_mask, colmap_img.name)
+        stable_edge_mask = torch.from_numpy(stable_edge_mask.astype(np.uint8)).to(self.device)
 
-        return full_img_path, id_map, interior_id_map, id_to_feat, id_to_score
+        return full_img_path, id_map, interior_id_map, id_to_feat, id_to_score, stable_edge_mask
 
     def export_stable_edge_masks(self):
         for img_key in tqdm(self.sorted_image_keys, desc="Preparing Stable Edge Masks"):
@@ -434,8 +474,8 @@ class SemanticVoter:
             processed = self._process_view(colmap_img, compute_clip_features=False)
             if processed is None:
                 continue
-            _, id_map, interior_id_map, id_to_feat, id_to_score = processed
-            del id_map, interior_id_map, id_to_feat, id_to_score
+            _, id_map, interior_id_map, id_to_feat, id_to_score, stable_edge_mask = processed
+            del id_map, interior_id_map, id_to_feat, id_to_score, stable_edge_mask
             torch.cuda.empty_cache()
 
     def run(self, anchors):
@@ -443,6 +483,13 @@ class SemanticVoter:
         anchor_features = torch.zeros((num_anchors, 512), device=self.device)
         anchor_score_sums = torch.zeros(num_anchors, device=self.device)
         anchor_view_counts = torch.zeros(num_anchors, device=self.device)
+        boundary_features = torch.zeros((num_anchors, 512), device=self.device)
+        boundary_score_sums = torch.zeros(num_anchors, device=self.device)
+        boundary_view_counts = torch.zeros(num_anchors, device=self.device)
+        boundary_depth_sums = torch.zeros(num_anchors, device=self.device)
+        boundary_depth_sq_sums = torch.zeros(num_anchors, device=self.device)
+        boundary_center_sums = torch.zeros(num_anchors, device=self.device)
+        boundary_dir_sums = torch.zeros((num_anchors, 3), device=self.device)
         
         for img_key in tqdm(self.sorted_image_keys, desc="Lifting Semantics"):
             colmap_img = self.images[img_key]
@@ -452,8 +499,9 @@ class SemanticVoter:
             if processed is None:
                 continue
 
-            _, id_map, interior_id_map, id_to_feat, id_to_score = processed
+            _, id_map, interior_id_map, id_to_feat, id_to_score, stable_edge_mask = processed
             h, w = id_map.shape
+            center_weight_map = self._build_center_weight_map(h, w)
             
             K = get_intrinsic_matrix(colmap_cam).to(self.device)
             scale_x = w / colmap_cam.width
@@ -479,6 +527,12 @@ class SemanticVoter:
                 continue
             
             sampled_ids = interior_id_map[v[valid_indices], u[valid_indices]]
+            sampled_boundary_ids = id_map[v[valid_indices], u[valid_indices]]
+            sampled_edge_mask = stable_edge_mask[v[valid_indices], u[valid_indices]] > 0
+            sampled_center_weight = center_weight_map[v[valid_indices], u[valid_indices]]
+            boundary_depth = depth[valid_indices]
+            camera_center = (-R.t() @ T).to(self.device)
+            view_dirs = F.normalize(camera_center.unsqueeze(0) - anchors[valid_indices], dim=-1)
             
             for mid, feat in id_to_feat.items():
                 mask_in_img = (sampled_ids == mid)
@@ -489,13 +543,30 @@ class SemanticVoter:
                 anchor_features[affected_anchors] += feat.unsqueeze(0) * score
                 anchor_score_sums[affected_anchors] += score
                 anchor_view_counts[affected_anchors] += 1
+
+                boundary_mask_in_img = sampled_edge_mask & (sampled_boundary_ids == mid)
+                boundary_anchors = valid_indices[boundary_mask_in_img]
+                if boundary_anchors.numel() == 0:
+                    continue
+
+                per_anchor_weight = score * sampled_center_weight[boundary_mask_in_img]
+                boundary_features[boundary_anchors] += feat.unsqueeze(0) * per_anchor_weight.unsqueeze(1)
+                boundary_score_sums[boundary_anchors] += per_anchor_weight
+                boundary_view_counts[boundary_anchors] += 1
+                boundary_depth_sums[boundary_anchors] += boundary_depth[boundary_mask_in_img]
+                boundary_depth_sq_sums[boundary_anchors] += boundary_depth[boundary_mask_in_img].pow(2)
+                boundary_center_sums[boundary_anchors] += sampled_center_weight[boundary_mask_in_img]
+                boundary_dir_sums[boundary_anchors] += view_dirs[boundary_mask_in_img]
             
-            del id_map, interior_id_map, id_to_feat, id_to_score
+            del id_map, interior_id_map, id_to_feat, id_to_score, stable_edge_mask, center_weight_map
             torch.cuda.empty_cache()
 
         mask = anchor_score_sums > 0
         anchor_features[mask] /= anchor_score_sums[mask].unsqueeze(1)
         anchor_features[mask] = F.normalize(anchor_features[mask], p=2, dim=-1)
+        boundary_mask = boundary_score_sums > 0
+        boundary_features[boundary_mask] /= boundary_score_sums[boundary_mask].unsqueeze(1)
+        boundary_features[boundary_mask] = F.normalize(boundary_features[boundary_mask], p=2, dim=-1)
 
         anchor_confidence = torch.zeros(num_anchors, device=self.device)
         if mask.any():
@@ -507,7 +578,8 @@ class SemanticVoter:
         
         print(f"[INFO] 3D Feature lifting done. Original shape: {anchor_features.shape}")
 
-        TARGET_DIM = 128
+        TARGET_DIM = self.target_feature_dim
+        pca = None
         if anchor_features.shape[1] > TARGET_DIM:
             print(f"[INFO] Applying PCA to reduce dimensions from {anchor_features.shape[1]} to {TARGET_DIM}...")
             valid_mask_cpu = mask.cpu().numpy()
@@ -522,13 +594,73 @@ class SemanticVoter:
                 reduced_features[mask] = F.normalize(reduced_features[mask], p=2, dim=-1)
                 anchor_features = reduced_features
                 print(f"[INFO] PCA done. New shape: {anchor_features.shape}")
+                if boundary_mask.any():
+                    reduced_boundary_features = torch.zeros((num_anchors, TARGET_DIM), device=self.device, dtype=torch.float32)
+                    transformed_boundary = pca.transform(boundary_features[boundary_mask].cpu().numpy())
+                    reduced_boundary_features[boundary_mask] = torch.tensor(transformed_boundary, device=self.device, dtype=torch.float32)
+                    reduced_boundary_features[boundary_mask] = F.normalize(reduced_boundary_features[boundary_mask], p=2, dim=-1)
+                    boundary_features = reduced_boundary_features
             else:
                 print("[WARN] Not enough valid features to run PCA. Skipping.")
+
+        boundary_confidence = torch.zeros(num_anchors, device=self.device)
+        angle_stability = torch.zeros(num_anchors, device=self.device)
+        depth_stability = torch.zeros(num_anchors, device=self.device)
+        center_stability = torch.zeros(num_anchors, device=self.device)
+        if boundary_mask.any():
+            avg_boundary_score = torch.zeros_like(boundary_confidence)
+            avg_boundary_score[boundary_mask] = boundary_score_sums[boundary_mask] / boundary_view_counts[boundary_mask].clamp_min(1.0)
+            view_boundary_conf = torch.clamp(boundary_view_counts / float(self.min_views), max=1.0)
+            mean_depth = torch.zeros_like(boundary_confidence)
+            mean_depth[boundary_mask] = boundary_depth_sums[boundary_mask] / boundary_view_counts[boundary_mask].clamp_min(1.0)
+            depth_var = torch.zeros_like(boundary_confidence)
+            depth_var[boundary_mask] = (
+                boundary_depth_sq_sums[boundary_mask] / boundary_view_counts[boundary_mask].clamp_min(1.0)
+            ) - mean_depth[boundary_mask].pow(2)
+            depth_var = depth_var.clamp_min(0.0)
+            depth_stability[boundary_mask] = 1.0 / (1.0 + torch.sqrt(depth_var[boundary_mask]) / mean_depth[boundary_mask].clamp_min(1e-3))
+            angle_stability[boundary_mask] = torch.norm(
+                boundary_dir_sums[boundary_mask] / boundary_view_counts[boundary_mask].unsqueeze(1).clamp_min(1.0),
+                dim=-1,
+            ).clamp(0.0, 1.0)
+            center_stability[boundary_mask] = (
+                boundary_center_sums[boundary_mask] / boundary_view_counts[boundary_mask].clamp_min(1.0)
+            ).clamp(0.0, 1.0)
+            boundary_confidence = (
+                0.35 * avg_boundary_score +
+                0.20 * view_boundary_conf +
+                0.15 * angle_stability +
+                0.15 * depth_stability +
+                0.15 * center_stability
+            )
+            boundary_confidence[~boundary_mask] = 0.0
+
+        selected_boundary_mask = (
+            boundary_mask &
+            (boundary_view_counts >= float(self.min_views)) &
+            (boundary_confidence >= self.boundary_candidate_confidence_threshold)
+        )
+        selected_indices = torch.nonzero(selected_boundary_mask, as_tuple=False).squeeze(1)
+        if self.boundary_candidate_max_count > 0 and selected_indices.numel() > self.boundary_candidate_max_count:
+            topk = torch.topk(boundary_confidence[selected_indices], k=self.boundary_candidate_max_count, largest=True).indices
+            selected_indices = selected_indices[topk]
+
+        boundary_candidates = {
+            "parent_anchor_indices": selected_indices.long(),
+            "positions": anchors[selected_indices].detach(),
+            "semantic_features": boundary_features[selected_indices].detach(),
+            "confidence": boundary_confidence[selected_indices].detach(),
+            "view_counts": boundary_view_counts[selected_indices].detach(),
+            "angle_stability": angle_stability[selected_indices].detach(),
+            "depth_stability": depth_stability[selected_indices].detach(),
+            "center_weight": center_stability[selected_indices].detach(),
+        }
 
         return {
             "features": anchor_features,
             "confidence": anchor_confidence,
             "valid_mask": mask,
+            "boundary_candidates": boundary_candidates,
         }
 
 
