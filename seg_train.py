@@ -1454,6 +1454,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--gpu", type=str, default = '-1')
+    parser.add_argument("--enable_backup", action="store_true", default=False, help="Copy a source snapshot into <model_path>/backup before training.")
     # [新增] 参数指定 SAM 权重路径
     parser.add_argument("--sam_checkpoint", type=str, default="./weights/sam_hq_vit_base", help="Path to SAM-HQ weights")
     parser.add_argument("--clip_model_path", type=str, default="openai/clip-vit-base-patch32", help="Local path or HF id for CLIP image model")
@@ -1468,11 +1469,14 @@ if __name__ == "__main__":
     if args.gpu != '-1':
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     
-    # 运行代码备份
-    try:
-        saveRuntimeCode(os.path.join(args.model_path, 'backup'))
-    except Exception as e:
-        logger.info(f'Save code failed: {e}')
+    # ??????
+    if args.enable_backup:
+        try:
+            saveRuntimeCode(os.path.join(args.model_path, 'backup'))
+        except Exception as e:
+            logger.info(f'Save code failed: {e}')
+    else:
+        logger.info('Code backup disabled. Skipping backup snapshot.')
 
     safe_state(args.quiet)
     network_gui.init(args.ip, args.port)

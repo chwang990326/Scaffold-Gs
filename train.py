@@ -525,6 +525,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--gpu", type=str, default = '-1')
+    parser.add_argument("--enable_backup", action="store_true", default=False, help="Copy a source snapshot into <model_path>/backup before training.")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -546,10 +547,13 @@ if __name__ == "__main__":
 
     
 
-    try:
-        saveRuntimeCode(os.path.join(args.model_path, 'backup'))
-    except:
-        logger.info(f'save code failed~')
+    if args.enable_backup:
+        try:
+            saveRuntimeCode(os.path.join(args.model_path, 'backup'))
+        except:
+            logger.info(f'save code failed~')
+    else:
+        logger.info('Code backup disabled. Skipping backup snapshot.')
         
     dataset = args.source_path.split('/')[-1]
     exp_name = args.model_path.split('/')[-2]
