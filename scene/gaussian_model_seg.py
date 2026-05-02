@@ -76,6 +76,7 @@ class GaussianModel:
         self.add_cov_dist = add_cov_dist
         self.add_color_dist = add_color_dist
         self.semantic_num_experts = max(1, int(semantic_num_experts))
+        self.semantic_expert_blend = 0.25
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -167,9 +168,22 @@ class GaussianModel:
             nn.Sigmoid()
         ).cuda()
 
+    def _create_color_expert_modules(self):
+        if self.semantic_num_experts <= 1:
+            return nn.ModuleList()
+        return nn.ModuleList([self._create_color_mlp() for _ in range(self.semantic_num_experts)])
+
     def init_semantic_color_modules(self):
         self.mlp_color_fallback = self._create_color_mlp()
-        self.mlp_color_experts = nn.ModuleList()
+        self.mlp_color_experts = self._create_color_expert_modules()
+
+    def has_semantic_color_experts(self):
+        return self.semantic_num_experts > 1 and len(self.mlp_color_experts) == self.semantic_num_experts
+
+    def ensure_semantic_color_experts(self):
+        expected_count = self.semantic_num_experts if self.semantic_num_experts > 1 else 0
+        if len(self.mlp_color_experts) != expected_count:
+            self.mlp_color_experts = self._create_color_expert_modules()
 
     @property
     def semantic_features(self):
@@ -289,6 +303,8 @@ class GaussianModel:
         if saved_num_experts is not None and int(saved_num_experts) != self.semantic_num_experts:
             self.semantic_num_experts = max(1, int(saved_num_experts))
             self.init_semantic_color_modules()
+        else:
+            self.ensure_semantic_color_experts()
 
         self.set_semantic_routing(
             cluster_ids=routing_state.get("semantic_cluster_ids"),
@@ -307,14 +323,66 @@ class GaussianModel:
         if source_state_dict is None:
             return
         self.mlp_color_fallback.load_state_dict(source_state_dict)
+        self.ensure_semantic_color_experts()
+        for expert in self.mlp_color_experts:
+            expert.load_state_dict(source_state_dict)
+
+    def get_color_expert_state(self):
+        return [expert.state_dict() for expert in self.mlp_color_experts]
+
+    def load_color_expert_state(self, expert_states, fallback_state_dict=None):
+        self.ensure_semantic_color_experts()
+        if not self.has_semantic_color_experts():
+            return
+
+        if not expert_states:
+            if fallback_state_dict is not None:
+                for expert in self.mlp_color_experts:
+                    expert.load_state_dict(fallback_state_dict)
+            return
+
+        for expert_idx, expert in enumerate(self.mlp_color_experts):
+            if expert_idx < len(expert_states):
+                expert.load_state_dict(expert_states[expert_idx])
+            elif fallback_state_dict is not None:
+                expert.load_state_dict(fallback_state_dict)
 
     def get_visible_semantic_cluster_ids(self, visible_mask=None):
-        return None
+        if not self.has_semantic_color_experts():
+            return None
+        if self._semantic_cluster_ids.dim() != 1 or self._semantic_cluster_ids.shape[0] != self.get_anchor.shape[0]:
+            return None
+        if visible_mask is None:
+            return self._semantic_cluster_ids
+        return self._semantic_cluster_ids[visible_mask]
 
     def predict_color(self, color_input, semantic_cluster_ids=None):
         if color_input.shape[0] == 0:
             return torch.empty((0, 3 * self.n_offsets), device=color_input.device, dtype=color_input.dtype)
-        return self.mlp_color_fallback(color_input)
+        base_color = self.mlp_color_fallback(color_input)
+        if (
+            not self.has_semantic_color_experts() or
+            semantic_cluster_ids is None or
+            semantic_cluster_ids.shape[0] != color_input.shape[0]
+        ):
+            return base_color
+
+        blend = float(max(0.0, min(1.0, self.semantic_expert_blend)))
+        if blend <= 0.0:
+            return base_color
+
+        semantic_cluster_ids = semantic_cluster_ids.to(device=color_input.device, dtype=torch.long).view(-1)
+        valid_mask = (semantic_cluster_ids >= 0) & (semantic_cluster_ids < len(self.mlp_color_experts))
+        if not valid_mask.any():
+            return base_color
+
+        final_color = base_color.clone()
+        for expert_idx in torch.unique(semantic_cluster_ids[valid_mask]).tolist():
+            expert_idx = int(expert_idx)
+            expert_mask = semantic_cluster_ids == expert_idx
+            expert_color = self.mlp_color_experts[expert_idx](color_input[expert_mask])
+            final_color[expert_mask] = base_color[expert_mask] + blend * (expert_color - base_color[expert_mask])
+        return final_color
 
     def reset_triangle_state(self, semantic_dim=None):
         if semantic_dim is None:
@@ -592,7 +660,8 @@ class GaussianModel:
         ]
         for param in main_params:
             param.requires_grad_(trainable)
-        for module in [self.mlp_opacity, self.mlp_cov, self.mlp_color_fallback]:
+        color_modules = [self.mlp_color_fallback] + list(self.mlp_color_experts)
+        for module in [self.mlp_opacity, self.mlp_cov] + color_modules:
             for param in module.parameters():
                 param.requires_grad_(trainable)
         if self.semantic_adapter is not None:
@@ -668,6 +737,8 @@ class GaussianModel:
             "mlp_cov": self.mlp_cov.state_dict(),
             "color_mlp": self.mlp_color_fallback.state_dict(),
         }
+        if self.has_semantic_color_experts():
+            module_state["color_expert_mlps"] = self.get_color_expert_state()
         if self.use_feat_bank:
             module_state["feature_bank_mlp"] = self.mlp_feature_bank.state_dict()
         if self.appearance_dim > 0:
@@ -687,6 +758,8 @@ class GaussianModel:
             self.warm_start_color_modules(module_state["color_mlp"])
         elif "mlp_color_fallback" in module_state:
             self.warm_start_color_modules(module_state["mlp_color_fallback"])
+        if "color_expert_mlps" in module_state:
+            self.load_color_expert_state(module_state["color_expert_mlps"], self.mlp_color_fallback.state_dict())
 
         if self.use_feat_bank and "feature_bank_mlp" in module_state:
             self.mlp_feature_bank.load_state_dict(module_state["feature_bank_mlp"])
@@ -697,6 +770,8 @@ class GaussianModel:
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
         self.mlp_color_fallback.eval()
+        for expert in self.mlp_color_experts:
+            expert.eval()
         if self.semantic_adapter is not None:
             self.semantic_adapter.eval()
         if self.appearance_dim > 0:
@@ -708,6 +783,8 @@ class GaussianModel:
         self.mlp_opacity.train()
         self.mlp_cov.train()
         self.mlp_color_fallback.train()
+        for expert in self.mlp_color_experts:
+            expert.train()
         if self.semantic_adapter is not None:
             self.semantic_adapter.train()
         if self.appearance_dim > 0:
@@ -950,6 +1027,8 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.set_triangle_hyperparams(training_args)
+        self.semantic_expert_blend = float(getattr(training_args, "semantic_expert_blend", self.semantic_expert_blend))
+        self.ensure_semantic_color_experts()
         if self._anchor_sem_feat.dim() != 2 or self._anchor_sem_feat.shape[0] != self.get_anchor.shape[0]:
             self._anchor_sem_feat = self._build_aligned_anchor_sem_feat(self.get_anchor.shape[0], self._anchor_sem_feat)
         if self._semantic_confidence.dim() != 1 or self._semantic_confidence.shape[0] != self.get_anchor.shape[0]:
@@ -970,6 +1049,8 @@ class GaussianModel:
             {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
             {'params': self.mlp_color_fallback.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color_fallback"},
         ]
+        for expert_idx, expert in enumerate(self.mlp_color_experts):
+            l.append({'params': expert.parameters(), 'lr': training_args.mlp_color_lr_init, "name": f"mlp_color_expert_{expert_idx}"})
 
         if self.use_feat_bank:
             l.append({'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"})
@@ -1039,6 +1120,8 @@ class GaussianModel:
             if param_group["name"] == "mlp_cov":
                 param_group['lr'] = self.mlp_cov_scheduler_args(iteration)
             if param_group["name"] == "mlp_color_fallback":
+                param_group['lr'] = self.mlp_color_scheduler_args(iteration)
+            if param_group["name"].startswith("mlp_color_expert_"):
                 param_group['lr'] = self.mlp_color_scheduler_args(iteration)
             if self.use_feat_bank and param_group["name"] == "mlp_featurebank":
                 param_group['lr'] = self.mlp_featurebank_scheduler_args(iteration)
@@ -1384,12 +1467,16 @@ class GaussianModel:
                 self.embedding_appearance.eval()
                 torch.jit.trace(self.embedding_appearance, torch.zeros((1,), dtype=torch.long).cuda()).save(os.path.join(path, 'embedding_appearance.pt'))
                 self.embedding_appearance.train()
+            torch.save(self.get_color_expert_state(), os.path.join(path, 'color_expert_mlps.pth'))
+            torch.save(self.get_semantic_routing_state(), os.path.join(path, 'semantic_routing_state.pth'))
             torch.save(self.get_triangle_state(), os.path.join(path, 'triangle_state.pth'))
         elif mode == 'unite':
             data = {
                 'opacity_mlp': self.mlp_opacity.state_dict(),
                 'cov_mlp': self.mlp_cov.state_dict(),
                 'color_mlp': self.mlp_color_fallback.state_dict(),
+                'color_expert_mlps': self.get_color_expert_state(),
+                'semantic_routing_state': self.get_semantic_routing_state(),
                 'triangle_state': self.get_triangle_state(),
             }
             if self.use_feat_bank: data['feature_bank_mlp'] = self.mlp_feature_bank.state_dict()
@@ -1398,6 +1485,11 @@ class GaussianModel:
 
     def load_mlp_checkpoints(self, path, mode = 'split'):
         if mode == 'split':
+            routing_state_path = os.path.join(path, 'semantic_routing_state.pth')
+            if os.path.exists(routing_state_path):
+                self.load_semantic_routing_state(torch.load(routing_state_path, map_location='cuda'))
+            else:
+                self.load_semantic_routing_state(None)
             self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
             self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
             shared_color_path = os.path.join(path, 'color_mlp.pt')
@@ -1408,8 +1500,11 @@ class GaussianModel:
                 self.warm_start_color_modules(torch.jit.load(fallback_path).cuda().state_dict())
             else:
                 raise FileNotFoundError(f"Neither {shared_color_path} nor {fallback_path} exists.")
-
-            self.load_semantic_routing_state(None)
+            expert_state_path = os.path.join(path, 'color_expert_mlps.pth')
+            if os.path.exists(expert_state_path):
+                self.load_color_expert_state(torch.load(expert_state_path, map_location='cuda'), self.mlp_color_fallback.state_dict())
+            else:
+                self.load_color_expert_state(None, self.mlp_color_fallback.state_dict())
             triangle_state_path = os.path.join(path, 'triangle_state.pth')
             if os.path.exists(triangle_state_path):
                 self.load_triangle_state(torch.load(triangle_state_path, map_location='cuda'))
@@ -1419,8 +1514,8 @@ class GaussianModel:
             if self.appearance_dim > 0: self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
         elif mode == 'unite':
             ckpt = torch.load(os.path.join(path, 'checkpoints.pth'))
+            self.load_semantic_routing_state(ckpt.get('semantic_routing_state'))
             self.load_module_state(ckpt)
-            self.load_semantic_routing_state(None)
             self.load_triangle_state(ckpt.get('triangle_state'))
             if self.use_feat_bank: self.mlp_feature_bank.load_state_dict(ckpt['feature_bank_mlp'])
             if self.appearance_dim > 0: self.embedding_appearance.load_state_dict(ckpt['appearance'])

@@ -50,6 +50,7 @@ from semantic_init_main import SemanticVoter
 
 # [新增] 导入用于降维可视化点云的库
 from sklearn.decomposition import PCA
+from sklearn.cluster import MiniBatchKMeans
 from plyfile import PlyData, PlyElement
 
 # [新增] 导入 matplotlib 用于生成曲线图
@@ -770,14 +771,59 @@ def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
         valid_mask = semantic_features.abs().sum(dim=1) > 0
     else:
         valid_mask = torch.zeros((num_anchors,), device="cuda", dtype=torch.bool)
+
+    requested_experts = max(1, int(getattr(dataset, "semantic_num_experts", 1)))
+    confidence_threshold = float(getattr(opt, "semantic_confidence_threshold", 0.6))
+    semantic_confidence = gaussians.semantic_confidence
+    if semantic_confidence.dim() != 1 or semantic_confidence.shape[0] != num_anchors:
+        semantic_confidence = valid_mask.float()
+
+    eligible_mask = valid_mask & (semantic_confidence >= confidence_threshold)
+    eligible_indices = torch.nonzero(eligible_mask, as_tuple=False).squeeze(1)
+    effective_experts = min(requested_experts, int(eligible_indices.numel()))
+
+    if requested_experts <= 1 or effective_experts <= 1:
+        gaussians.set_semantic_routing(cluster_ids, valid_mask, initialized=True)
+        if logger:
+            valid_count = int(valid_mask.sum().item())
+            eligible_count = int(eligible_indices.numel())
+            logger.info(
+                f"[SEMANTIC] Shared color head only. valid={valid_count}, "
+                f"high_conf={eligible_count}, requested_experts={requested_experts}."
+            )
+        return
+
+    semantic_cluster_features = F.normalize(semantic_features[eligible_indices], p=2, dim=-1)
+    anchor_xyz = gaussians.get_anchor[eligible_indices]
+    anchor_xyz = anchor_xyz - anchor_xyz.mean(dim=0, keepdim=True)
+    anchor_xyz = anchor_xyz / anchor_xyz.std(dim=0, keepdim=True).clamp_min(1e-6)
+    xyz_weight = float(getattr(opt, "semantic_cluster_xyz_weight", 0.15))
+    cluster_features = torch.cat([semantic_cluster_features, xyz_weight * anchor_xyz], dim=1).detach().cpu().numpy()
+
+    batch_size = max(1, min(int(getattr(opt, "semantic_cluster_batch_size", 2048)), cluster_features.shape[0]))
+    kmeans = MiniBatchKMeans(
+        n_clusters=effective_experts,
+        random_state=int(getattr(opt, "semantic_cluster_seed", 42)),
+        batch_size=batch_size,
+        n_init=3,
+        max_iter=100,
+        reassignment_ratio=0.01,
+    )
+    predicted_labels = kmeans.fit_predict(cluster_features)
+    cluster_ids[eligible_indices] = torch.from_numpy(predicted_labels).to(device="cuda", dtype=torch.long)
     gaussians.set_semantic_routing(cluster_ids, valid_mask, initialized=True)
 
     if logger:
         valid_count = int(valid_mask.sum().item())
+        eligible_count = int(eligible_indices.numel())
+        fallback_count = int((cluster_ids < 0).sum().item())
+        cluster_sizes = [int((cluster_ids == expert_idx).sum().item()) for expert_idx in range(effective_experts)]
         logger.info(
-            f"[SEMANTIC] Shared color head enabled. Expert routing disabled; "
-            f"{valid_count} anchors keep semantic validity flags only."
+            f"[SEMANTIC] Enabled {effective_experts} semantic color experts "
+            f"(requested={requested_experts}, valid={valid_count}, high_conf={eligible_count}, "
+            f"fallback={fallback_count})."
         )
+        logger.info(f"[SEMANTIC] Expert cluster sizes: {cluster_sizes}")
 
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sam_checkpoint, clip_model_path, wandb=None, logger=None, ply_path=None):

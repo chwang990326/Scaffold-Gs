@@ -164,7 +164,9 @@ class OptimizationParams(ParamGroup):
         self.semantic_min_interior_pixels = 32
         self.semantic_cluster_seed = 42
         self.semantic_cluster_batch_size = 2_048
+        self.semantic_cluster_xyz_weight = 0.15
         self.semantic_missing_policy = "shared_fallback"
+        self.semantic_expert_blend = 0.25
         self.boundary_loss_weight = 0.01
         self.boundary_loss_start_ratio = 0.6
         self.boundary_loss_ramp_iters = 2_000
