@@ -457,6 +457,44 @@ def point_to_segment_distance(grid, a, b):
     return torch.norm(grid - closest, dim=-1)
 
 
+def build_triangle_support_map(center_uv, thickness, confidence, center_weight, height, width, opt, device, dtype):
+    support_map = torch.zeros((1, height, width), device=device, dtype=dtype)
+    if center_uv.shape[0] == 0:
+        return support_map
+
+    base_radius = float(getattr(opt, "triangle_support_radius", 18.0))
+    thickness_scale = float(getattr(opt, "triangle_support_thickness_scale", 4.0))
+    sigma_ratio = max(float(getattr(opt, "triangle_support_sigma_ratio", 0.5)), 1e-3)
+
+    for idx in range(center_uv.shape[0]):
+        center_x = float(center_uv[idx, 0].item())
+        center_y = float(center_uv[idx, 1].item())
+        radius = max(2.0, base_radius + thickness_scale * float(thickness[idx, 0].item()))
+        sigma = max(1.0, radius * sigma_ratio)
+
+        x0 = max(int(math.floor(center_x - radius)), 0)
+        x1 = min(int(math.ceil(center_x + radius)), width - 1)
+        y0 = max(int(math.floor(center_y - radius)), 0)
+        y1 = min(int(math.ceil(center_y + radius)), height - 1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        ys = torch.arange(y0, y1 + 1, device=device, dtype=dtype)
+        xs = torch.arange(x0, x1 + 1, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        dist2 = (xx - center_x).pow(2) + (yy - center_y).pow(2)
+        local_support = torch.exp(-dist2 / (2.0 * sigma * sigma))
+
+        local_strength = confidence[idx].clamp(0.0, 1.0) * (0.5 + 0.5 * center_weight[idx].clamp(0.0, 1.0))
+        local_support = local_support * local_strength
+        support_map[:, y0:y1 + 1, x0:x1 + 1] = torch.maximum(
+            support_map[:, y0:y1 + 1, x0:x1 + 1],
+            local_support.unsqueeze(0),
+        )
+
+    return support_map.clamp_(0.0, 1.0)
+
+
 def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
     height = int(viewpoint_camera.image_height)
     width = int(viewpoint_camera.image_width)
@@ -469,6 +507,7 @@ def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
         "triangle_alpha": zero_alpha,
         "triangle_rgb_residual": zero_rgb,
         "triangle_weight_sum": zero_alpha.clone(),
+        "triangle_support_map": zero_alpha.clone(),
         "triangle_count": 0,
         "triangle_visible_count": 0,
     }
@@ -494,14 +533,43 @@ def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
     if not valid_depth_mask.any():
         return empty_result
 
+    for key, value in list(triangle_state.items()):
+        if torch.is_tensor(value) and value.shape[0] == valid_depth_mask.shape[0]:
+            triangle_state[key] = value[valid_depth_mask]
+    ctrl = triangle_state["ctrl"]
+    uv = uv[valid_depth_mask]
+    depth = depth[valid_depth_mask]
+
     alpha_accum = torch.zeros((1, height, width), device=device, dtype=dtype)
     weight_accum = torch.zeros((1, height, width), device=device, dtype=dtype)
     rgb_accum = torch.zeros((3, height, width), device=device, dtype=dtype)
     sharpness = float(getattr(opt, "triangle_render_sharpness", 6.0))
     depth_temperature = float(getattr(opt, "triangle_depth_temperature", 0.25))
+    triangle_support_map = zero_alpha.clone()
+
+    center_uv, center_depth = project_points_to_image(viewpoint_camera, triangle_state["target_center"])
+    center_valid_mask = (
+        (center_depth > 0.05) &
+        (center_uv[:, 0] >= 0.0) &
+        (center_uv[:, 0] <= float(width - 1)) &
+        (center_uv[:, 1] >= 0.0) &
+        (center_uv[:, 1] <= float(height - 1))
+    )
+    if center_valid_mask.any():
+        triangle_support_map = build_triangle_support_map(
+            center_uv[center_valid_mask],
+            triangle_state["thickness"][center_valid_mask],
+            triangle_state["confidence"][center_valid_mask],
+            triangle_state["center_weight"][center_valid_mask],
+            height,
+            width,
+            opt,
+            device,
+            dtype,
+        )
 
     visible_count = 0
-    for tri_idx in torch.nonzero(valid_depth_mask, as_tuple=False).squeeze(1).tolist():
+    for tri_idx in range(ctrl.shape[0]):
         verts = uv[tri_idx]
         tri_depth = depth[tri_idx].mean()
         thickness = triangle_state["thickness"][tri_idx, 0]
@@ -546,6 +614,7 @@ def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
         "triangle_alpha": triangle_alpha,
         "triangle_rgb_residual": triangle_rgb_residual,
         "triangle_weight_sum": weight_accum,
+        "triangle_support_map": triangle_support_map,
         "triangle_count": int(ctrl.shape[0]),
         "triangle_visible_count": int(visible_count),
     }
@@ -601,27 +670,56 @@ def compute_triangle_branch_losses(render_pkg, gt_image, image_name, boundary_ma
     losses = {}
     gt_gray = rgb_to_grayscale(gt_image)
     gt_grad = sobel_gradient_magnitude(gt_gray)
-    gt_edge_mask = (gt_grad > getattr(opt, "boundary_gt_grad_thresh", 0.08)).to(dtype=triangle_alpha.dtype)
+    low_thresh = float(getattr(opt, "boundary_gt_grad_thresh", 0.08))
+    high_thresh = max(
+        low_thresh + 1e-3,
+        float(getattr(opt, "triangle_gt_grad_high_thresh", max(low_thresh * 2.0, low_thresh + 0.08))),
+    )
+    gt_grad_strength = ((gt_grad - low_thresh) / max(high_thresh - low_thresh, 1e-6)).clamp(0.0, 1.0)
+    gt_edge_mask = (gt_grad_strength > 0).to(dtype=triangle_alpha.dtype)
+    triangle_support = render_pkg.get("triangle_support_map", None)
+    if triangle_support is None or float(triangle_support.max().item()) <= 1e-6:
+        triangle_support = torch.ones_like(edge_mask)
+    else:
+        triangle_support = triangle_support.to(device=triangle_alpha.device, dtype=triangle_alpha.dtype)
 
     edge_core = edge_mask.clamp(0.0, 1.0)
+    support_min_weight = float(getattr(opt, "triangle_support_min_weight", 0.10))
+    support_mask = (triangle_support >= support_min_weight).to(dtype=triangle_alpha.dtype)
+    base_core = edge_core * gt_edge_mask * support_mask
+
+    peak_kernel = max(1, int(getattr(opt, "triangle_gt_peak_kernel", 3)))
+    if peak_kernel % 2 == 0:
+        peak_kernel += 1
+    if peak_kernel > 1:
+        local_max = F.max_pool2d(gt_grad, kernel_size=peak_kernel, stride=1, padding=peak_kernel // 2)
+        gt_peak_mask = (gt_grad >= (local_max - 1e-6)).to(dtype=triangle_alpha.dtype)
+    else:
+        gt_peak_mask = torch.ones_like(edge_core)
+
+    refined_core = base_core * gt_peak_mask
+    if int((refined_core > 0).sum().item()) < int(getattr(opt, "triangle_peak_min_pixels", 64)):
+        refined_core = base_core
+
     band_kernel = max(1, int(getattr(opt, "triangle_mask_band_kernel", 3)))
     if band_kernel % 2 == 0:
         band_kernel += 1
     if band_kernel > 1:
-        edge_band = F.max_pool2d(edge_core, kernel_size=band_kernel, stride=1, padding=band_kernel // 2)
+        edge_band = F.max_pool2d(base_core, kernel_size=band_kernel, stride=1, padding=band_kernel // 2)
     else:
-        edge_band = edge_core
-    edge_ring = (edge_band - edge_core).clamp(0.0, 1.0)
+        edge_band = base_core
+    edge_ring = (edge_band - refined_core).clamp(0.0, 1.0)
     soft_target = torch.clamp(
-        edge_core + float(getattr(opt, "triangle_mask_ring_weight", 0.35)) * edge_ring,
+        refined_core * (0.5 + 0.5 * gt_grad_strength) +
+        float(getattr(opt, "triangle_mask_ring_weight", 0.35)) * edge_ring * gt_grad_strength,
         0.0,
         1.0,
     )
-    supervision_weight = edge_band * center_weight * gt_edge_mask
-    active_pixels = int((supervision_weight > 0).sum().item())
+    supervision_weight = edge_band * center_weight * gt_grad_strength * triangle_support
+    active_pixels = int((supervision_weight > support_min_weight).sum().item())
 
     if active_pixels >= int(getattr(opt, "triangle_mask_min_pixels", getattr(opt, "boundary_min_pixels", 256))):
-        # Use GT edge gating plus a soft band target so slight projection offsets are not punished as full failures.
+        # Restrict supervision to edge regions that visible triangles can plausibly explain in this view.
         mask_residual = torch.abs(triangle_alpha - soft_target) * supervision_weight
         losses["mask"] = mask_residual.sum() / supervision_weight.sum().clamp_min(1e-6)
 
