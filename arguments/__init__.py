@@ -196,9 +196,9 @@ class OptimizationParams(ParamGroup):
         self.triangle_mask_band_kernel = 3
         self.triangle_mask_ring_weight = 0.35
         self.triangle_mask_min_pixels = 256
-        self.triangle_support_radius = 18.0
-        self.triangle_support_thickness_scale = 4.0
-        self.triangle_support_sigma_ratio = 0.5
+        self.triangle_support_band_scale = 2.5
+        self.triangle_support_band_bias = 2.0
+        self.triangle_support_sharpness_scale = 0.5
         self.triangle_support_min_weight = 0.10
         self.triangle_gt_grad_high_thresh = 0.16
         self.triangle_gt_peak_kernel = 3

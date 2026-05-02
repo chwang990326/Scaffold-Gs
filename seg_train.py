@@ -457,44 +457,6 @@ def point_to_segment_distance(grid, a, b):
     return torch.norm(grid - closest, dim=-1)
 
 
-def build_triangle_support_map(center_uv, thickness, confidence, center_weight, height, width, opt, device, dtype):
-    support_map = torch.zeros((1, height, width), device=device, dtype=dtype)
-    if center_uv.shape[0] == 0:
-        return support_map
-
-    base_radius = float(getattr(opt, "triangle_support_radius", 18.0))
-    thickness_scale = float(getattr(opt, "triangle_support_thickness_scale", 4.0))
-    sigma_ratio = max(float(getattr(opt, "triangle_support_sigma_ratio", 0.5)), 1e-3)
-
-    for idx in range(center_uv.shape[0]):
-        center_x = float(center_uv[idx, 0].item())
-        center_y = float(center_uv[idx, 1].item())
-        radius = max(2.0, base_radius + thickness_scale * float(thickness[idx, 0].item()))
-        sigma = max(1.0, radius * sigma_ratio)
-
-        x0 = max(int(math.floor(center_x - radius)), 0)
-        x1 = min(int(math.ceil(center_x + radius)), width - 1)
-        y0 = max(int(math.floor(center_y - radius)), 0)
-        y1 = min(int(math.ceil(center_y + radius)), height - 1)
-        if x1 <= x0 or y1 <= y0:
-            continue
-
-        ys = torch.arange(y0, y1 + 1, device=device, dtype=dtype)
-        xs = torch.arange(x0, x1 + 1, device=device, dtype=dtype)
-        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-        dist2 = (xx - center_x).pow(2) + (yy - center_y).pow(2)
-        local_support = torch.exp(-dist2 / (2.0 * sigma * sigma))
-
-        local_strength = confidence[idx].clamp(0.0, 1.0) * (0.5 + 0.5 * center_weight[idx].clamp(0.0, 1.0))
-        local_support = local_support * local_strength
-        support_map[:, y0:y1 + 1, x0:x1 + 1] = torch.maximum(
-            support_map[:, y0:y1 + 1, x0:x1 + 1],
-            local_support.unsqueeze(0),
-        )
-
-    return support_map.clamp_(0.0, 1.0)
-
-
 def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
     height = int(viewpoint_camera.image_height)
     width = int(viewpoint_camera.image_width)
@@ -546,27 +508,9 @@ def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
     sharpness = float(getattr(opt, "triangle_render_sharpness", 6.0))
     depth_temperature = float(getattr(opt, "triangle_depth_temperature", 0.25))
     triangle_support_map = zero_alpha.clone()
-
-    center_uv, center_depth = project_points_to_image(viewpoint_camera, triangle_state["target_center"])
-    center_valid_mask = (
-        (center_depth > 0.05) &
-        (center_uv[:, 0] >= 0.0) &
-        (center_uv[:, 0] <= float(width - 1)) &
-        (center_uv[:, 1] >= 0.0) &
-        (center_uv[:, 1] <= float(height - 1))
-    )
-    if center_valid_mask.any():
-        triangle_support_map = build_triangle_support_map(
-            center_uv[center_valid_mask],
-            triangle_state["thickness"][center_valid_mask],
-            triangle_state["confidence"][center_valid_mask],
-            triangle_state["center_weight"][center_valid_mask],
-            height,
-            width,
-            opt,
-            device,
-            dtype,
-        )
+    support_band_scale = float(getattr(opt, "triangle_support_band_scale", 2.5))
+    support_band_bias = float(getattr(opt, "triangle_support_band_bias", 2.0))
+    support_sharpness_scale = float(getattr(opt, "triangle_support_sharpness_scale", 0.5))
 
     visible_count = 0
     for tri_idx in range(ctrl.shape[0]):
@@ -575,12 +519,16 @@ def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
         thickness = triangle_state["thickness"][tri_idx, 0]
         alpha = triangle_state["alpha"][tri_idx, 0]
         rgb_residual = triangle_state["rgb_residual"][tri_idx]
+        confidence_weight = triangle_state["confidence"][tri_idx].clamp(0.0, 1.0)
+        center_quality = triangle_state["center_weight"][tri_idx].clamp(0.0, 1.0)
+        support_thickness = thickness * support_band_scale + support_band_bias
+        support_pad = max(float(thickness.item()), float(support_thickness.item())) + 2.0
+        support_sharpness = max(1.0, sharpness * support_sharpness_scale)
 
-        pad = float(thickness.item()) + 2.0
-        x0 = max(int(torch.floor(verts[:, 0].min() - pad).item()), 0)
-        x1 = min(int(torch.ceil(verts[:, 0].max() + pad).item()), width - 1)
-        y0 = max(int(torch.floor(verts[:, 1].min() - pad).item()), 0)
-        y1 = min(int(torch.ceil(verts[:, 1].max() + pad).item()), height - 1)
+        x0 = max(int(torch.floor(verts[:, 0].min() - support_pad).item()), 0)
+        x1 = min(int(torch.ceil(verts[:, 0].max() + support_pad).item()), width - 1)
+        y0 = max(int(torch.floor(verts[:, 1].min() - support_pad).item()), 0)
+        y1 = min(int(torch.ceil(verts[:, 1].max() + support_pad).item()), height - 1)
         if x1 <= x0 or y1 <= y0:
             continue
 
@@ -593,6 +541,14 @@ def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
         dist12 = point_to_segment_distance(grid, verts[1], verts[2])
         dist20 = point_to_segment_distance(grid, verts[2], verts[0])
         edge_dist = torch.minimum(dist01, torch.minimum(dist12, dist20))
+
+        support_strength = confidence_weight * (0.5 + 0.5 * center_quality)
+        support_band = torch.sigmoid((support_thickness - edge_dist) * support_sharpness) * support_strength
+        triangle_support_map[:, y0:y1 + 1, x0:x1 + 1] = torch.maximum(
+            triangle_support_map[:, y0:y1 + 1, x0:x1 + 1],
+            support_band.unsqueeze(0),
+        )
+
         band_alpha = torch.sigmoid((thickness - edge_dist) * sharpness) * alpha
         if float(band_alpha.max().item()) <= 1e-6:
             continue
@@ -644,8 +600,13 @@ def hybrid_render(viewpoint_camera, gaussians, pipe, bg_color, opt, scaling_modi
 
 
 def compute_triangle_branch_losses(render_pkg, gt_image, image_name, boundary_mask_dir, opt, mask_cache, center_weight_cache, gaussians):
+    stats = {
+        "support_active_pixels": 0,
+        "refined_core_pixels": 0,
+        "supervision_active_pixels": 0,
+    }
     if render_pkg.get("triangle_visible_count", 0) <= 0:
-        return {}
+        return {}, stats
 
     triangle_alpha = render_pkg["triangle_alpha"]
     edge_mask = load_stable_edge_mask(
@@ -657,7 +618,7 @@ def compute_triangle_branch_losses(render_pkg, gt_image, image_name, boundary_ma
         triangle_alpha.dtype,
     )
     if edge_mask is None:
-        return {}
+        return {}, stats
 
     center_weight = get_center_weight_map(
         triangle_alpha.shape[-2],
@@ -686,6 +647,7 @@ def compute_triangle_branch_losses(render_pkg, gt_image, image_name, boundary_ma
     edge_core = edge_mask.clamp(0.0, 1.0)
     support_min_weight = float(getattr(opt, "triangle_support_min_weight", 0.10))
     support_mask = (triangle_support >= support_min_weight).to(dtype=triangle_alpha.dtype)
+    stats["support_active_pixels"] = int((support_mask > 0).sum().item())
     base_core = edge_core * gt_edge_mask * support_mask
 
     peak_kernel = max(1, int(getattr(opt, "triangle_gt_peak_kernel", 3)))
@@ -700,6 +662,7 @@ def compute_triangle_branch_losses(render_pkg, gt_image, image_name, boundary_ma
     refined_core = base_core * gt_peak_mask
     if int((refined_core > 0).sum().item()) < int(getattr(opt, "triangle_peak_min_pixels", 64)):
         refined_core = base_core
+    stats["refined_core_pixels"] = int((refined_core > 0).sum().item())
 
     band_kernel = max(1, int(getattr(opt, "triangle_mask_band_kernel", 3)))
     if band_kernel % 2 == 0:
@@ -717,6 +680,7 @@ def compute_triangle_branch_losses(render_pkg, gt_image, image_name, boundary_ma
     )
     supervision_weight = edge_band * center_weight * gt_grad_strength * triangle_support
     active_pixels = int((supervision_weight > support_min_weight).sum().item())
+    stats["supervision_active_pixels"] = active_pixels
 
     if active_pixels >= int(getattr(opt, "triangle_mask_min_pixels", getattr(opt, "boundary_min_pixels", 256))):
         # Restrict supervision to edge regions that visible triangles can plausibly explain in this view.
@@ -729,7 +693,7 @@ def compute_triangle_branch_losses(render_pkg, gt_image, image_name, boundary_ma
 
     triangle_state = gaussians.get_active_triangle_state()
     if triangle_state is None:
-        return losses
+        return losses, stats
 
     if triangle_state["semantic_feat"].shape[0] > 0 and triangle_state["semantic_target"].shape == triangle_state["semantic_feat"].shape:
         triangle_feat = F.normalize(triangle_state["semantic_feat"], p=2, dim=-1)
@@ -760,7 +724,7 @@ def compute_triangle_branch_losses(render_pkg, gt_image, image_name, boundary_ma
             0.1 * rgb_sparse.mean()
         )
 
-    return losses
+    return losses, stats
 
 
 def get_triangle_stage_code(stage_name):
@@ -771,7 +735,7 @@ def get_triangle_stage_code(stage_name):
     return 0
 
 
-def build_triangle_log_message(iteration, stage_name, triangle_total_count, triangle_active_count, triangle_view_count, triangle_visible_count, triangle_scale, triangle_loss_values, triangle_weights):
+def build_triangle_log_message(iteration, stage_name, triangle_total_count, triangle_active_count, triangle_view_count, triangle_visible_count, triangle_scale, triangle_loss_values, triangle_weights, triangle_support_active_pixels=0, triangle_refined_core_pixels=0, triangle_supervision_active_pixels=0):
     if triangle_loss_values:
         loss_terms = ", ".join(
             f"{name}={triangle_loss_values[name]:.6f}(w={triangle_weights.get(name, 0.0):.6f})"
@@ -783,6 +747,9 @@ def build_triangle_log_message(iteration, stage_name, triangle_total_count, tria
         f"[TRIANGLE][Iter {iteration}] stage={stage_name} "
         f"total={triangle_total_count} active={triangle_active_count} "
         f"view={triangle_view_count} visible={triangle_visible_count} "
+        f"support_active_pixels={triangle_support_active_pixels} "
+        f"refined_core_pixels={triangle_refined_core_pixels} "
+        f"supervision_active_pixels={triangle_supervision_active_pixels} "
         f"scale={triangle_scale:.4f} losses={loss_terms}"
     )
 
@@ -1134,9 +1101,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         triangle_scale = get_triangle_loss_scale(iteration, opt)
         triangle_losses = {}
+        triangle_stats = {
+            "support_active_pixels": 0,
+            "refined_core_pixels": 0,
+            "supervision_active_pixels": 0,
+        }
         triangle_weights = {}
         if triangle_branch_active and triangle_scale > 0:
-            triangle_losses = compute_triangle_branch_losses(
+            triangle_losses, triangle_stats = compute_triangle_branch_losses(
                 render_pkg,
                 gt_image,
                 viewpoint_cam.image_name,
@@ -1174,6 +1146,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             triangle_active_count = int(gaussians._triangle_active_mask.sum().item()) if gaussians._triangle_active_mask.dim() == 1 else 0
             triangle_view_count = int(render_pkg.get("triangle_count", 0))
             triangle_visible_count = int(render_pkg.get("triangle_visible_count", 0))
+            triangle_support_active_pixels = int(triangle_stats.get("support_active_pixels", 0))
+            triangle_refined_core_pixels = int(triangle_stats.get("refined_core_pixels", 0))
+            triangle_supervision_active_pixels = int(triangle_stats.get("supervision_active_pixels", 0))
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
                     "Loss": f"{ema_loss_for_log:.7f}",
@@ -1209,6 +1184,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 tb_writer.add_scalar(f'{dataset_name}/train_triangle/active_count', triangle_active_count, iteration)
                 tb_writer.add_scalar(f'{dataset_name}/train_triangle/view_count', triangle_view_count, iteration)
                 tb_writer.add_scalar(f'{dataset_name}/train_triangle/visible_count', triangle_visible_count, iteration)
+                tb_writer.add_scalar(f'{dataset_name}/train_triangle/support_active_pixels', triangle_support_active_pixels, iteration)
+                tb_writer.add_scalar(f'{dataset_name}/train_triangle/refined_core_pixels', triangle_refined_core_pixels, iteration)
+                tb_writer.add_scalar(f'{dataset_name}/train_triangle/supervision_active_pixels', triangle_supervision_active_pixels, iteration)
             if wandb is not None:
                 wandb.log({
                     "train_triangle_scale": triangle_scale,
@@ -1218,6 +1196,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     "train_triangle_active_count": triangle_active_count,
                     "train_triangle_view_count": triangle_view_count,
                     "train_triangle_visible_count": triangle_visible_count,
+                    "train_triangle_support_active_pixels": triangle_support_active_pixels,
+                    "train_triangle_refined_core_pixels": triangle_refined_core_pixels,
+                    "train_triangle_supervision_active_pixels": triangle_supervision_active_pixels,
                 })
 
             for loss_name, loss_value in triangle_loss_values.items():
@@ -1249,6 +1230,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         triangle_scale,
                         triangle_loss_values,
                         triangle_weights,
+                        triangle_support_active_pixels,
+                        triangle_refined_core_pixels,
+                        triangle_supervision_active_pixels,
                     )
                 )
 
