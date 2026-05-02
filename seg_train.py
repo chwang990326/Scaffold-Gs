@@ -503,11 +503,11 @@ def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
     depth = depth[valid_depth_mask]
 
     alpha_accum = torch.zeros((1, height, width), device=device, dtype=dtype)
+    support_accum = torch.zeros((1, height, width), device=device, dtype=dtype)
     weight_accum = torch.zeros((1, height, width), device=device, dtype=dtype)
     rgb_accum = torch.zeros((3, height, width), device=device, dtype=dtype)
     sharpness = float(getattr(opt, "triangle_render_sharpness", 6.0))
     depth_temperature = float(getattr(opt, "triangle_depth_temperature", 0.25))
-    triangle_support_map = zero_alpha.clone()
     support_band_scale = float(getattr(opt, "triangle_support_band_scale", 2.5))
     support_band_bias = float(getattr(opt, "triangle_support_band_bias", 2.0))
     support_sharpness_scale = float(getattr(opt, "triangle_support_sharpness_scale", 0.5))
@@ -544,16 +544,16 @@ def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
 
         support_strength = confidence_weight * (0.5 + 0.5 * center_quality)
         support_band = torch.sigmoid((support_thickness - edge_dist) * support_sharpness) * support_strength
-        triangle_support_map[:, y0:y1 + 1, x0:x1 + 1] = torch.maximum(
-            triangle_support_map[:, y0:y1 + 1, x0:x1 + 1],
-            support_band.unsqueeze(0),
-        )
+        if float(support_band.max().item()) <= 1e-6:
+            continue
+
+        depth_weight = torch.exp(-tri_depth * depth_temperature)
+        support_accum[:, y0:y1 + 1, x0:x1 + 1] += (support_band * depth_weight).unsqueeze(0)
 
         band_alpha = torch.sigmoid((thickness - edge_dist) * sharpness) * alpha
         if float(band_alpha.max().item()) <= 1e-6:
             continue
 
-        depth_weight = torch.exp(-tri_depth * depth_temperature)
         contribution = band_alpha * depth_weight
 
         alpha_accum[:, y0:y1 + 1, x0:x1 + 1] += contribution.unsqueeze(0)
@@ -564,6 +564,7 @@ def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
     if visible_count == 0:
         return empty_result
 
+    triangle_support_map = 1.0 - torch.exp(-support_accum)
     triangle_alpha = 1.0 - torch.exp(-alpha_accum)
     triangle_rgb_residual = rgb_accum / weight_accum.clamp_min(1e-6)
     return {
