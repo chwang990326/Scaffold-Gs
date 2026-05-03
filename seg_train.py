@@ -366,7 +366,38 @@ def get_triangle_supervision_start_iter(opt):
 
 
 def is_triangle_branch_enabled(opt):
-    return not bool(getattr(opt, "disable_triangle_branch", False))
+    return (
+        bool(getattr(opt, "enable_triangle_branch", False)) and
+        not bool(getattr(opt, "disable_triangle_branch", False))
+    )
+
+
+def get_effective_method_name(dataset, opt, triangle_branch_enabled):
+    num_experts = int(getattr(dataset, "semantic_num_experts", 1))
+    boundary_weight = float(getattr(opt, "boundary_loss_weight", 0.0))
+    if triangle_branch_enabled:
+        return "hybrid_triangle"
+    if boundary_weight > 0:
+        return "semantic_boundary_shared" if num_experts <= 1 else "semantic_boundary_expert"
+    if num_experts > 1:
+        return "semantic_expert_clean"
+    return "semantic_shared_clean"
+
+
+def log_effective_method_config(dataset, opt, triangle_branch_enabled, logger):
+    if logger is None:
+        return
+    logger.info(
+        "[METHOD] effective=%s profile=%s experts=%d expert_blend=%.3f "
+        "xyz_weight=%.3f boundary_weight=%.4f triangle_enabled=%s",
+        get_effective_method_name(dataset, opt, triangle_branch_enabled),
+        getattr(opt, "method_profile", "manual"),
+        int(getattr(dataset, "semantic_num_experts", 1)),
+        float(getattr(opt, "semantic_expert_blend", 0.25)),
+        float(getattr(opt, "semantic_cluster_xyz_weight", 0.15)),
+        float(getattr(opt, "boundary_loss_weight", 0.0)),
+        triangle_branch_enabled,
+    )
 
 
 def get_triangle_joint_start_iter(opt):
@@ -855,6 +886,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     TARGET_SEMANTIC_DIM = 128
     boundary_candidates = None
     triangle_branch_enabled = is_triangle_branch_enabled(opt)
+    log_effective_method_config(dataset, opt, triangle_branch_enabled, logger)
     
     if os.path.exists(sem_save_path):
         logger.info(f"[SEMANTIC] Loading cached semantic features from {sem_save_path}")
@@ -1034,12 +1066,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             f"[BOUNDARY] Supervision starts at iter {get_boundary_supervision_start_iter(opt)} "
             f"with weight {getattr(opt, 'boundary_loss_weight', 0.01):.4f}."
         )
-        if boundary_masks_ready:
+        if getattr(opt, "boundary_loss_weight", 0.0) <= 0:
+            logger.info("[BOUNDARY] Disabled because boundary_loss_weight <= 0.")
+        elif boundary_masks_ready:
             logger.info(f"[BOUNDARY] Stable edge masks ready at {boundary_mask_dir}.")
         else:
             logger.info("[BOUNDARY] Stable edge masks not found; auxiliary boundary loss stays inactive.")
         if not triangle_branch_enabled:
-            logger.info("[TRIANGLE] Disabled by --disable_triangle_branch.")
+            if getattr(opt, "disable_triangle_branch", False):
+                logger.info("[TRIANGLE] Disabled by --disable_triangle_branch.")
+            else:
+                logger.info("[TRIANGLE] Disabled by default. Use --enable_triangle_branch for hybrid boundary experiments.")
         elif boundary_candidates is not None:
             logger.info(
                 f"[TRIANGLE] Cached {boundary_candidates['parent_anchor_indices'].shape[0]} boundary candidates. "
@@ -1582,6 +1619,74 @@ def get_logger(path):
     logger.addHandler(fileinfo); logger.addHandler(controlshow)
     return logger
 
+
+def _cli_has_option(argv, option_name):
+    option = "--" + option_name
+    return any(arg == option or arg.startswith(option + "=") for arg in argv)
+
+
+def _set_profile_default(args, argv, name, value, changes):
+    if _cli_has_option(argv, name):
+        return
+    old_value = getattr(args, name, None)
+    setattr(args, name, value)
+    if old_value != value:
+        changes.append(f"{name}: {old_value} -> {value}")
+
+
+def apply_method_profile(args, argv):
+    profile = str(getattr(args, "method_profile", "manual")).strip().lower()
+    changes = []
+    if profile in ("", "manual", "none"):
+        return changes
+
+    if profile == "semantic_expert_clean":
+        _set_profile_default(args, argv, "semantic_num_experts", 4, changes)
+        _set_profile_default(args, argv, "semantic_expert_blend", 0.25, changes)
+        _set_profile_default(args, argv, "semantic_cluster_xyz_weight", 0.15, changes)
+        _set_profile_default(args, argv, "boundary_loss_weight", 0.0, changes)
+        _set_profile_default(args, argv, "enable_triangle_branch", False, changes)
+        return changes
+
+    if profile == "semantic_shared_clean":
+        _set_profile_default(args, argv, "semantic_num_experts", 1, changes)
+        _set_profile_default(args, argv, "boundary_loss_weight", 0.0, changes)
+        _set_profile_default(args, argv, "enable_triangle_branch", False, changes)
+        return changes
+
+    if profile == "boundary_shared":
+        _set_profile_default(args, argv, "semantic_num_experts", 1, changes)
+        _set_profile_default(args, argv, "boundary_loss_weight", 0.01, changes)
+        _set_profile_default(args, argv, "boundary_loss_start_ratio", 0.6, changes)
+        _set_profile_default(args, argv, "boundary_loss_ramp_iters", 2000, changes)
+        _set_profile_default(args, argv, "enable_triangle_branch", False, changes)
+        return changes
+
+    if profile == "hybrid_late_triangle":
+        _set_profile_default(args, argv, "semantic_num_experts", 1, changes)
+        _set_profile_default(args, argv, "boundary_loss_weight", 0.01, changes)
+        _set_profile_default(args, argv, "boundary_loss_start_ratio", 0.6, changes)
+        _set_profile_default(args, argv, "boundary_loss_ramp_iters", 2000, changes)
+        _set_profile_default(args, argv, "enable_triangle_branch", True, changes)
+        _set_profile_default(args, argv, "triangle_init_start_iter", 24000, changes)
+        _set_profile_default(args, argv, "triangle_only_iters", 1000, changes)
+        _set_profile_default(args, argv, "triangle_ramp_iters", 500, changes)
+        _set_profile_default(args, argv, "triangle_confidence_threshold", 0.55, changes)
+        _set_profile_default(args, argv, "triangle_max_candidates", 1024, changes)
+        _set_profile_default(args, argv, "triangle_render_max_per_view", 256, changes)
+        _set_profile_default(args, argv, "triangle_loss_weight_mask", 0.02, changes)
+        _set_profile_default(args, argv, "triangle_loss_weight_edge_rgb", 0.01, changes)
+        _set_profile_default(args, argv, "triangle_loss_weight_sem", 0.005, changes)
+        _set_profile_default(args, argv, "triangle_loss_weight_mv", 0.002, changes)
+        _set_profile_default(args, argv, "triangle_loss_weight_depth", 0.002, changes)
+        _set_profile_default(args, argv, "triangle_loss_weight_reg", 0.001, changes)
+        return changes
+
+    raise ValueError(
+        f"Unknown method_profile '{profile}'. Choose one of: manual, "
+        "semantic_expert_clean, semantic_shared_clean, boundary_shared, hybrid_late_triangle."
+    )
+
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
@@ -1604,12 +1709,22 @@ if __name__ == "__main__":
     parser.add_argument("--sam_checkpoint", type=str, default="./weights/sam_hq_vit_base", help="Path to SAM-HQ weights")
     parser.add_argument("--clip_model_path", type=str, default="openai/clip-vit-base-patch32", help="Local path or HF id for CLIP image model")
 
-    args = parser.parse_args(sys.argv[1:])
+    argv = sys.argv[1:]
+    args = parser.parse_args(argv)
     args.save_iterations.append(args.iterations)
 
     model_path = args.model_path
     os.makedirs(model_path, exist_ok=True)
     logger = get_logger(model_path)
+    try:
+        profile_changes = apply_method_profile(args, argv)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    if getattr(args, "method_profile", "manual") not in ("manual", "none", ""):
+        if profile_changes:
+            logger.info(f"[METHOD] Applied method_profile={args.method_profile}: {profile_changes}")
+        else:
+            logger.info(f"[METHOD] method_profile={args.method_profile} requested; explicit CLI values already match or override the profile.")
 
     if args.gpu != '-1':
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)

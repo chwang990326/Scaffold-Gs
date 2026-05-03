@@ -162,12 +162,13 @@ class OptimizationParams(ParamGroup):
         self.semantic_min_views = 2
         self.semantic_boundary_kernel = 5
         self.semantic_min_interior_pixels = 32
+        self.method_profile = "manual"
         self.semantic_cluster_seed = 42
         self.semantic_cluster_batch_size = 2_048
         self.semantic_cluster_xyz_weight = 0.15
         self.semantic_missing_policy = "shared_fallback"
         self.semantic_expert_blend = 0.25
-        self.boundary_loss_weight = 0.01
+        self.boundary_loss_weight = 0.0
         self.boundary_loss_start_ratio = 0.6
         self.boundary_loss_ramp_iters = 2_000
         self.boundary_mask_score_thresh = 0.90
@@ -180,6 +181,7 @@ class OptimizationParams(ParamGroup):
         self.boundary_gt_grad_thresh = 0.08
         self.boundary_min_pixels = 256
         self.triangle_feature_dim = 128
+        self.enable_triangle_branch = False
         self.disable_triangle_branch = False
         self.triangle_init_start_iter = -1
         self.triangle_only_iters = 1_000
