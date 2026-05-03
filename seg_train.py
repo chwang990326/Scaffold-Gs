@@ -354,6 +354,8 @@ def compute_boundary_sharpen_loss(rendered_image, gt_image, image_name, boundary
 
 
 def get_triangle_supervision_start_iter(opt):
+    if not is_triangle_branch_enabled(opt):
+        return int(getattr(opt, "iterations", 30000)) + 1
     explicit_start = int(getattr(opt, "triangle_init_start_iter", -1))
     default_start = max(
         opt.update_until + 1,
@@ -361,6 +363,10 @@ def get_triangle_supervision_start_iter(opt):
         get_boundary_supervision_start_iter(opt),
     )
     return explicit_start if explicit_start >= 0 else default_start
+
+
+def is_triangle_branch_enabled(opt):
+    return not bool(getattr(opt, "disable_triangle_branch", False))
 
 
 def get_triangle_joint_start_iter(opt):
@@ -474,6 +480,9 @@ def render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt):
         "triangle_count": 0,
         "triangle_visible_count": 0,
     }
+
+    if not is_triangle_branch_enabled(opt):
+        return empty_result
 
     triangle_state = gaussians.get_active_triangle_state(visible_mask=visible_mask)
     if triangle_state is None:
@@ -845,6 +854,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     boundary_candidate_save_path = os.path.join(dataset.model_path, "boundary_candidates.pt")
     TARGET_SEMANTIC_DIM = 128
     boundary_candidates = None
+    triangle_branch_enabled = is_triangle_branch_enabled(opt)
     
     if os.path.exists(sem_save_path):
         logger.info(f"[SEMANTIC] Loading cached semantic features from {sem_save_path}")
@@ -877,7 +887,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         gaussians.semantic_valid_mask = gaussians.semantic_confidence > 0
         logger.info(f"[SEMANTIC] Loaded semantic features for {gaussians.semantic_features.shape[0]} anchors.")
-        if os.path.exists(boundary_candidate_save_path):
+        if triangle_branch_enabled and os.path.exists(boundary_candidate_save_path):
             boundary_candidates = sanitize_boundary_candidates(
                 torch.load(boundary_candidate_save_path, map_location="cuda"),
                 gaussians.get_anchor.shape[0],
@@ -890,8 +900,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 )
         torch.cuda.empty_cache()
 
+    needs_semantic_lifting = not os.path.exists(sem_save_path)
+    needs_triangle_candidates = triangle_branch_enabled and not os.path.exists(boundary_candidate_save_path)
     if boundary_candidates is None and sam_checkpoint and os.path.exists(sam_checkpoint) and (
-        not os.path.exists(sem_save_path) or not os.path.exists(boundary_candidate_save_path)
+        needs_semantic_lifting or needs_triangle_candidates
     ):
         if os.path.exists(sem_save_path):
             logger.info("[TRIANGLE] Semantic cache exists but boundary candidate cache is missing. Re-running semantic lifting for boundary candidates.")
@@ -929,13 +941,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             gaussians.get_anchor.shape[0],
             device="cuda",
         )
+        if not triangle_branch_enabled:
+            boundary_candidates = None
         
         torch.save(gaussians.semantic_features, sem_save_path)
         torch.save(gaussians.semantic_confidence, sem_conf_save_path)
-        if boundary_candidates is not None:
+        if triangle_branch_enabled and boundary_candidates is not None:
             torch.save(boundary_candidates, boundary_candidate_save_path)
         logger.info(f"[SEMANTIC] Saved semantic features to {sem_save_path}")
-        if boundary_candidates is not None:
+        if triangle_branch_enabled and boundary_candidates is not None:
             logger.info(
                 f"[TRIANGLE] Saved {boundary_candidates['parent_anchor_indices'].shape[0]} boundary candidates to {boundary_candidate_save_path}"
             )
@@ -952,7 +966,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gaussians.semantic_features = torch.zeros((gaussians.get_anchor.shape[0], TARGET_SEMANTIC_DIM), device="cuda")
         gaussians.semantic_confidence = torch.zeros((gaussians.get_anchor.shape[0],), device="cuda")
         gaussians.semantic_valid_mask = torch.zeros((gaussians.get_anchor.shape[0],), device="cuda", dtype=torch.bool)
-    if boundary_candidates is None and os.path.exists(boundary_candidate_save_path):
+    if triangle_branch_enabled and boundary_candidates is None and os.path.exists(boundary_candidate_save_path):
         boundary_candidates = sanitize_boundary_candidates(
             torch.load(boundary_candidate_save_path, map_location="cuda"),
             gaussians.get_anchor.shape[0],
@@ -1024,7 +1038,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             logger.info(f"[BOUNDARY] Stable edge masks ready at {boundary_mask_dir}.")
         else:
             logger.info("[BOUNDARY] Stable edge masks not found; auxiliary boundary loss stays inactive.")
-        if boundary_candidates is not None:
+        if not triangle_branch_enabled:
+            logger.info("[TRIANGLE] Disabled by --disable_triangle_branch.")
+        elif boundary_candidates is not None:
             logger.info(
                 f"[TRIANGLE] Cached {boundary_candidates['parent_anchor_indices'].shape[0]} boundary candidates. "
                 f"Triangle init starts at iter {triangle_start_iter}, joint finetune starts at iter {triangle_joint_iter}."
@@ -1048,13 +1064,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        if iteration >= triangle_start_iter and not gaussians.triangle_initialized:
+        if triangle_branch_enabled and iteration >= triangle_start_iter and not gaussians.triangle_initialized:
             initialized_triangles = gaussians.initialize_boundary_triangles(boundary_candidates, opt, logger)
             if initialized_triangles > 0:
                 gaussians.add_triangle_optimizer_groups(opt)
 
         desired_stage = "main"
-        if gaussians.has_boundary_triangles and iteration >= triangle_start_iter:
+        if triangle_branch_enabled and gaussians.has_boundary_triangles and iteration >= triangle_start_iter:
             desired_stage = "triangle_only" if iteration < triangle_joint_iter else "joint"
         if desired_stage != current_train_stage:
             if desired_stage == "main":
@@ -1122,7 +1138,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 semantic_weight = semantic_scale * opt.semantic_loss_weight
                 loss = loss + semantic_weight * semantic_loss
 
-        triangle_branch_active = gaussians.has_boundary_triangles and iteration >= triangle_start_iter
+        triangle_branch_active = triangle_branch_enabled and gaussians.has_boundary_triangles and iteration >= triangle_start_iter
         boundary_loss = None
         boundary_weight = 0.0
         boundary_active_pixels = 0
@@ -1260,10 +1276,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
             triangle_log_interval = max(1, int(getattr(opt, "triangle_log_interval", 50)))
             should_log_triangle = (
-                iteration == triangle_start_iter or
-                iteration == triangle_joint_iter or
+                (triangle_branch_enabled and iteration == triangle_start_iter) or
+                (triangle_branch_enabled and iteration == triangle_joint_iter) or
                 (triangle_branch_active and iteration % triangle_log_interval == 0) or
-                (gaussians.triangle_initialized and triangle_visible_count == 0 and iteration % 10 == 0)
+                (triangle_branch_enabled and gaussians.triangle_initialized and triangle_visible_count == 0 and iteration % 10 == 0)
             )
             if logger is not None and should_log_triangle:
                 logger.info(

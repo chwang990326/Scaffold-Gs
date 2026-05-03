@@ -180,6 +180,7 @@ class OptimizationParams(ParamGroup):
         self.boundary_gt_grad_thresh = 0.08
         self.boundary_min_pixels = 256
         self.triangle_feature_dim = 128
+        self.disable_triangle_branch = False
         self.triangle_init_start_iter = -1
         self.triangle_only_iters = 1_000
         self.triangle_ramp_iters = 1_000
