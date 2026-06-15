@@ -160,6 +160,8 @@ class OptimizationParams(ParamGroup):
         self.semantic_min_count = 64
         self.semantic_confidence_threshold = 0.6
         self.semantic_min_views = 2
+        self.semantic_view_stride = 1
+        self.semantic_view_offset = 0
         self.semantic_boundary_kernel = 5
         self.semantic_min_interior_pixels = 32
         self.method_profile = "manual"

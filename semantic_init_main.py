@@ -295,6 +295,8 @@ class SemanticVoter:
         boundary_candidate_confidence_threshold=0.55,
         boundary_candidate_max_count=1024,
         target_feature_dim=128,
+        view_stride=1,
+        view_offset=0,
     ):
         self.device = device
         self.scene_path = scene_path
@@ -317,6 +319,8 @@ class SemanticVoter:
         self.boundary_candidate_confidence_threshold = float(boundary_candidate_confidence_threshold)
         self.boundary_candidate_max_count = max(0, int(boundary_candidate_max_count))
         self.target_feature_dim = max(1, int(target_feature_dim))
+        self.view_stride = max(1, int(view_stride))
+        self.view_offset = max(0, int(view_offset))
         
         # [???] ?????? 2D ?????????????????
         self.mask_out_dir = os.path.join(scene_path, "semantic_masks_2d")
@@ -332,6 +336,13 @@ class SemanticVoter:
         self.cameras = read_cameras_binary(os.path.join(sparse_dir, "cameras.bin"))
         self.images = read_images_binary(os.path.join(sparse_dir, "images.bin"))
         self.sorted_image_keys = sorted(self.images.keys(), key=lambda x: self.images[x].name)
+        self.selected_image_keys = self.sorted_image_keys[self.view_offset::self.view_stride]
+        if len(self.selected_image_keys) == 0 and len(self.sorted_image_keys) > 0:
+            self.selected_image_keys = [self.sorted_image_keys[min(self.view_offset, len(self.sorted_image_keys) - 1)]]
+        print(
+            f"[INFO] Semantic views selected: {len(self.selected_image_keys)}/{len(self.sorted_image_keys)} "
+            f"(stride={self.view_stride}, offset={self.view_offset})"
+        )
 
     def _resolve_image_path(self, image_name):
         full_img_path = os.path.join(self.scene_path, "images_4", image_name)
@@ -469,7 +480,7 @@ class SemanticVoter:
         return full_img_path, id_map, interior_id_map, id_to_feat, id_to_score, stable_edge_mask
 
     def export_stable_edge_masks(self):
-        for img_key in tqdm(self.sorted_image_keys, desc="Preparing Stable Edge Masks"):
+        for img_key in tqdm(self.selected_image_keys, desc="Preparing Stable Edge Masks"):
             colmap_img = self.images[img_key]
             processed = self._process_view(colmap_img, compute_clip_features=False)
             if processed is None:
@@ -491,7 +502,7 @@ class SemanticVoter:
         boundary_center_sums = torch.zeros(num_anchors, device=self.device)
         boundary_dir_sums = torch.zeros((num_anchors, 3), device=self.device)
         
-        for img_key in tqdm(self.sorted_image_keys, desc="Lifting Semantics"):
+        for img_key in tqdm(self.selected_image_keys, desc="Lifting Semantics"):
             colmap_img = self.images[img_key]
             colmap_cam = self.cameras[colmap_img.camera_id]
 
