@@ -207,7 +207,7 @@ class GaussianModel:
     def get_visible_semantic_cluster_ids(self, visible_mask=None):
         return None
 
-    def predict_color(self, color_input, semantic_cluster_ids=None):
+    def predict_color(self, color_input, semantic_cluster_ids=None, visible_mask=None):
         if color_input.shape[0] == 0:
             return torch.empty((0, 3 * self.n_offsets), device=color_input.device, dtype=color_input.dtype)
         return self.mlp_color(color_input)

@@ -79,7 +79,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             color_input = cat_local_view
         else:
             color_input = cat_local_view_wodist
-    color = pc.predict_color(color_input, semantic_cluster_ids)
+    color = pc.predict_color(color_input, semantic_cluster_ids, visible_mask=visible_mask)
     color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask]
 
     # get offset's cov

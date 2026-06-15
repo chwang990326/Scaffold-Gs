@@ -1105,6 +1105,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+        gaussians.maybe_activate_local_context(iteration, opt, logger)
+
         if triangle_branch_enabled and iteration >= triangle_start_iter and not gaussians.triangle_initialized:
             initialized_triangles = gaussians.initialize_boundary_triangles(boundary_candidates, opt, logger)
             if initialized_triangles > 0:
@@ -1501,6 +1503,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.semantic_num_experts)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
+        if getattr(gaussians, "local_context_enabled", False):
+            gaussians.build_local_context_neighbors(logger=logger)
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
         if opt is None:
@@ -1652,6 +1656,22 @@ def apply_method_profile(args, argv):
         _set_profile_default(args, argv, "enable_triangle_branch", False, changes)
         return changes
 
+    if profile == "semantic_expert_strong_8_b05":
+        _set_profile_default(args, argv, "semantic_num_experts", 8, changes)
+        _set_profile_default(args, argv, "semantic_expert_blend", 0.5, changes)
+        _set_profile_default(args, argv, "semantic_cluster_xyz_weight", 0.15, changes)
+        _set_profile_default(args, argv, "boundary_loss_weight", 0.0, changes)
+        _set_profile_default(args, argv, "enable_triangle_branch", False, changes)
+        return changes
+
+    if profile == "semantic_expert_strong_8_b10":
+        _set_profile_default(args, argv, "semantic_num_experts", 8, changes)
+        _set_profile_default(args, argv, "semantic_expert_blend", 1.0, changes)
+        _set_profile_default(args, argv, "semantic_cluster_xyz_weight", 0.15, changes)
+        _set_profile_default(args, argv, "boundary_loss_weight", 0.0, changes)
+        _set_profile_default(args, argv, "enable_triangle_branch", False, changes)
+        return changes
+
     if profile == "semantic_shared_clean":
         _set_profile_default(args, argv, "semantic_num_experts", 1, changes)
         _set_profile_default(args, argv, "boundary_loss_weight", 0.0, changes)
@@ -1688,7 +1708,9 @@ def apply_method_profile(args, argv):
 
     raise ValueError(
         f"Unknown method_profile '{profile}'. Choose one of: manual, "
-        "semantic_expert_clean, semantic_shared_clean, boundary_shared, hybrid_late_triangle."
+        "semantic_expert_clean, semantic_expert_strong_8_b05, "
+        "semantic_expert_strong_8_b10, semantic_shared_clean, boundary_shared, "
+        "hybrid_late_triangle."
     )
 
 if __name__ == "__main__":

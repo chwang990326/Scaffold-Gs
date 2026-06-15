@@ -170,6 +170,14 @@ class OptimizationParams(ParamGroup):
         self.semantic_cluster_xyz_weight = 0.15
         self.semantic_missing_policy = "shared_fallback"
         self.semantic_expert_blend = 0.25
+        self.local_context_enabled = False
+        self.local_context_k = 8
+        self.local_context_dim = 16
+        self.local_context_blend = 0.05
+        self.local_context_lr_init = 0.001
+        self.local_context_lr_final = 0.00005
+        self.local_context_start_iter = -1
+        self.local_context_chunk_size = 32_768
         self.boundary_loss_weight = 0.0
         self.boundary_loss_start_ratio = 0.6
         self.boundary_loss_ramp_iters = 2_000

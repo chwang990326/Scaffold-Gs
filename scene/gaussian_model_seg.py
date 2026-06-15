@@ -115,6 +115,18 @@ class GaussianModel:
         self.triangle_thickness_scheduler_args = None
         self.triangle_color_scheduler_args = None
         self.triangle_semantic_scheduler_args = None
+        self.local_context_enabled = False
+        self.local_context_active = False
+        self.local_context_k = 8
+        self.local_context_dim = 16
+        self.local_context_blend = 0.05
+        self.local_context_start_iter = -1
+        self.local_context_chunk_size = 32768
+        self.local_context_neighbor_indices = torch.empty((0, 0), device="cuda", dtype=torch.long)
+        self.local_context_message_mlp = None
+        self.local_context_fuse_mlp = None
+        self.local_context_color_mlp = None
+        self.local_context_scheduler_args = None
         
         self.opacity_accum = torch.empty(0)
 
@@ -159,6 +171,7 @@ class GaussianModel:
 
         self.color_dist_dim = 1 if self.add_color_dist else 0
         self.init_semantic_color_modules()
+        self.init_local_context_modules(self.local_context_dim)
 
     def _create_color_mlp(self):
         return nn.Sequential(
@@ -176,6 +189,50 @@ class GaussianModel:
     def init_semantic_color_modules(self):
         self.mlp_color_fallback = self._create_color_mlp()
         self.mlp_color_experts = self._create_color_expert_modules()
+
+    def init_local_context_modules(self, context_dim):
+        context_dim = max(1, int(context_dim))
+        message_in_dim = self.feat_dim * 2 + 4
+        self.local_context_dim = context_dim
+        self.local_context_message_mlp = nn.Sequential(
+            nn.Linear(message_in_dim, context_dim),
+            nn.ReLU(True),
+            nn.Linear(context_dim, context_dim),
+            nn.ReLU(True),
+        ).cuda()
+        self.local_context_fuse_mlp = nn.Sequential(
+            nn.Linear(self.feat_dim + 2 * context_dim, context_dim),
+            nn.ReLU(True),
+            nn.Linear(context_dim, context_dim),
+            nn.ReLU(True),
+        ).cuda()
+        self.local_context_color_mlp = nn.Sequential(
+            nn.Linear(context_dim, self.feat_dim),
+            nn.ReLU(True),
+            nn.Linear(self.feat_dim, 3 * self.n_offsets),
+            nn.Sigmoid(),
+        ).cuda()
+
+    def _local_context_modules_match(self, context_dim):
+        return (
+            self.local_context_message_mlp is not None and
+            self.local_context_fuse_mlp is not None and
+            self.local_context_color_mlp is not None and
+            self.local_context_message_mlp[0].out_features == int(context_dim) and
+            self.local_context_color_mlp[-2].out_features == 3 * self.n_offsets
+        )
+
+    def configure_local_context(self, training_args):
+        self.local_context_enabled = bool(getattr(training_args, "local_context_enabled", False))
+        self.local_context_k = max(1, int(getattr(training_args, "local_context_k", self.local_context_k)))
+        self.local_context_dim = max(1, int(getattr(training_args, "local_context_dim", self.local_context_dim)))
+        self.local_context_blend = float(getattr(training_args, "local_context_blend", self.local_context_blend))
+        self.local_context_start_iter = int(getattr(training_args, "local_context_start_iter", self.local_context_start_iter))
+        self.local_context_chunk_size = max(1, int(getattr(training_args, "local_context_chunk_size", self.local_context_chunk_size)))
+        if not self._local_context_modules_match(self.local_context_dim):
+            self.init_local_context_modules(self.local_context_dim)
+        if not self.local_context_enabled:
+            self.local_context_active = False
 
     def has_semantic_color_experts(self):
         return self.semantic_num_experts > 1 and len(self.mlp_color_experts) == self.semantic_num_experts
@@ -356,7 +413,131 @@ class GaussianModel:
             return self._semantic_cluster_ids
         return self._semantic_cluster_ids[visible_mask]
 
-    def predict_color(self, color_input, semantic_cluster_ids=None):
+    def local_context_is_ready(self):
+        return (
+            self.local_context_enabled and
+            self.local_context_active and
+            self.local_context_blend > 0.0 and
+            self.local_context_neighbor_indices.dim() == 2 and
+            self.local_context_neighbor_indices.shape[0] == self.get_anchor.shape[0] and
+            self.local_context_neighbor_indices.shape[1] > 0 and
+            self.local_context_message_mlp is not None and
+            self.local_context_fuse_mlp is not None and
+            self.local_context_color_mlp is not None
+        )
+
+    def build_local_context_neighbors(self, k=None, logger=None):
+        if not self.local_context_enabled:
+            self.local_context_active = False
+            return False
+
+        anchor_count = self.get_anchor.shape[0]
+        if anchor_count <= 1:
+            self.local_context_neighbor_indices = torch.empty((anchor_count, 0), device="cuda", dtype=torch.long)
+            self.local_context_active = False
+            return False
+
+        k = max(1, int(k if k is not None else self.local_context_k))
+        effective_k = min(k, anchor_count - 1)
+        try:
+            from sklearn.neighbors import NearestNeighbors
+            xyz = self.get_anchor.detach().float().cpu().numpy()
+            n_query = min(effective_k + 1, anchor_count)
+            knn = NearestNeighbors(n_neighbors=n_query, algorithm="auto")
+            knn.fit(xyz)
+            neighbor_candidates = knn.kneighbors(xyz, return_distance=False)
+            neighbor_indices = np.empty((anchor_count, effective_k), dtype=np.int64)
+            for anchor_idx in range(anchor_count):
+                row = neighbor_candidates[anchor_idx]
+                row = row[row != anchor_idx]
+                if row.shape[0] == 0:
+                    row = np.array([anchor_idx], dtype=np.int64)
+                if row.shape[0] < effective_k:
+                    row = np.pad(row, (0, effective_k - row.shape[0]), mode="edge")
+                neighbor_indices[anchor_idx] = row[:effective_k]
+            self.local_context_neighbor_indices = torch.from_numpy(neighbor_indices).to(device="cuda", dtype=torch.long)
+            self.local_context_active = True
+            if logger is not None:
+                logger.info(
+                    f"[LOCAL_CONTEXT] Built KNN neighbor cache for {anchor_count} anchors "
+                    f"(k={effective_k}, dim={self.local_context_dim}, blend={self.local_context_blend:.4f})."
+                )
+            return True
+        except Exception as exc:
+            self.local_context_neighbor_indices = torch.empty((0, 0), device="cuda", dtype=torch.long)
+            self.local_context_active = False
+            if logger is not None:
+                logger.warning(f"[LOCAL_CONTEXT] Failed to build KNN neighbor cache: {exc}")
+            return False
+
+    def maybe_activate_local_context(self, iteration, training_args, logger=None):
+        if not self.local_context_enabled:
+            return False
+        start_iter = self.local_context_start_iter
+        if start_iter < 0:
+            start_iter = int(getattr(training_args, "update_until", 0)) + 1
+        if iteration < start_iter or self.local_context_is_ready():
+            return False
+        return self.build_local_context_neighbors(self.local_context_k, logger=logger)
+
+    def compute_local_context_features(self, visible_mask=None):
+        if not self.local_context_is_ready():
+            return None
+
+        anchor_count = self.get_anchor.shape[0]
+        if visible_mask is None:
+            anchor_indices = torch.arange(anchor_count, device="cuda", dtype=torch.long)
+        else:
+            if visible_mask.dim() != 1 or visible_mask.shape[0] != anchor_count:
+                return None
+            anchor_indices = torch.nonzero(visible_mask, as_tuple=False).squeeze(1)
+
+        if anchor_indices.numel() == 0:
+            return torch.empty((0, self.local_context_dim), device="cuda", dtype=self._anchor_feat.dtype)
+
+        context_chunks = []
+        feat_source = self._anchor_feat.detach()
+        xyz_source = self.get_anchor.detach()
+        chunk_size = max(1, int(self.local_context_chunk_size))
+        for start in range(0, anchor_indices.numel(), chunk_size):
+            current_indices = anchor_indices[start:start + chunk_size]
+            neighbor_indices = self.local_context_neighbor_indices[current_indices]
+
+            center_feat = feat_source[current_indices]
+            neighbor_feat = feat_source[neighbor_indices]
+            center_feat_expanded = center_feat.unsqueeze(1).expand(-1, neighbor_indices.shape[1], -1)
+
+            center_xyz = xyz_source[current_indices]
+            neighbor_xyz = xyz_source[neighbor_indices]
+            relative_xyz = neighbor_xyz - center_xyz.unsqueeze(1)
+            relative_dist = torch.norm(relative_xyz, dim=-1, keepdim=True)
+
+            pair_input = torch.cat(
+                [center_feat_expanded, neighbor_feat, relative_xyz, relative_dist],
+                dim=-1,
+            )
+            pair_messages = self.local_context_message_mlp(
+                pair_input.reshape(-1, pair_input.shape[-1])
+            ).view(current_indices.shape[0], neighbor_indices.shape[1], self.local_context_dim)
+
+            local_mean = pair_messages.mean(dim=1)
+            local_max = pair_messages.max(dim=1)[0]
+            context_input = torch.cat([center_feat, local_mean, local_max], dim=-1)
+            context_chunks.append(self.local_context_fuse_mlp(context_input))
+
+        return torch.cat(context_chunks, dim=0)
+
+    def apply_local_context_color(self, color, visible_mask=None):
+        if not self.local_context_is_ready():
+            return color
+        context_feat = self.compute_local_context_features(visible_mask)
+        if context_feat is None or context_feat.shape[0] != color.shape[0]:
+            return color
+        context_color = self.local_context_color_mlp(context_feat).to(dtype=color.dtype)
+        blend = float(max(0.0, min(1.0, self.local_context_blend)))
+        return color + blend * (context_color - color)
+
+    def predict_color(self, color_input, semantic_cluster_ids=None, visible_mask=None):
         if color_input.shape[0] == 0:
             return torch.empty((0, 3 * self.n_offsets), device=color_input.device, dtype=color_input.dtype)
         base_color = self.mlp_color_fallback(color_input)
@@ -365,16 +546,16 @@ class GaussianModel:
             semantic_cluster_ids is None or
             semantic_cluster_ids.shape[0] != color_input.shape[0]
         ):
-            return base_color
+            return self.apply_local_context_color(base_color, visible_mask)
 
         blend = float(max(0.0, min(1.0, self.semantic_expert_blend)))
         if blend <= 0.0:
-            return base_color
+            return self.apply_local_context_color(base_color, visible_mask)
 
         semantic_cluster_ids = semantic_cluster_ids.to(device=color_input.device, dtype=torch.long).view(-1)
         valid_mask = (semantic_cluster_ids >= 0) & (semantic_cluster_ids < len(self.mlp_color_experts))
         if not valid_mask.any():
-            return base_color
+            return self.apply_local_context_color(base_color, visible_mask)
 
         final_color = base_color.clone()
         for expert_idx in torch.unique(semantic_cluster_ids[valid_mask]).tolist():
@@ -382,7 +563,7 @@ class GaussianModel:
             expert_mask = semantic_cluster_ids == expert_idx
             expert_color = self.mlp_color_experts[expert_idx](color_input[expert_mask])
             final_color[expert_mask] = base_color[expert_mask] + blend * (expert_color - base_color[expert_mask])
-        return final_color
+        return self.apply_local_context_color(final_color, visible_mask)
 
     def reset_triangle_state(self, semantic_dim=None):
         if semantic_dim is None:
@@ -664,6 +845,10 @@ class GaussianModel:
         for module in [self.mlp_opacity, self.mlp_cov] + color_modules:
             for param in module.parameters():
                 param.requires_grad_(trainable)
+        for module in [self.local_context_message_mlp, self.local_context_fuse_mlp, self.local_context_color_mlp]:
+            if module is not None:
+                for param in module.parameters():
+                    param.requires_grad_(trainable)
         if self.semantic_adapter is not None:
             for param in self.semantic_adapter.parameters():
                 param.requires_grad_(trainable)
@@ -731,11 +916,50 @@ class GaussianModel:
                 continue
             self.optimizer.add_param_group({"params": params, "lr": lr, "name": name})
 
+    def get_local_context_state(self):
+        return {
+            "enabled": self.local_context_enabled,
+            "active": self.local_context_active,
+            "k": self.local_context_k,
+            "dim": self.local_context_dim,
+            "blend": self.local_context_blend,
+            "start_iter": self.local_context_start_iter,
+            "chunk_size": self.local_context_chunk_size,
+            "message_mlp": self.local_context_message_mlp.state_dict() if self.local_context_message_mlp is not None else None,
+            "fuse_mlp": self.local_context_fuse_mlp.state_dict() if self.local_context_fuse_mlp is not None else None,
+            "color_mlp": self.local_context_color_mlp.state_dict() if self.local_context_color_mlp is not None else None,
+        }
+
+    def load_local_context_state(self, local_context_state):
+        if local_context_state is None:
+            self.local_context_active = False
+            self.local_context_neighbor_indices = torch.empty((0, 0), device="cuda", dtype=torch.long)
+            return
+
+        self.local_context_enabled = bool(local_context_state.get("enabled", False))
+        self.local_context_active = bool(local_context_state.get("active", False))
+        self.local_context_k = max(1, int(local_context_state.get("k", self.local_context_k)))
+        self.local_context_dim = max(1, int(local_context_state.get("dim", self.local_context_dim)))
+        self.local_context_blend = float(local_context_state.get("blend", self.local_context_blend))
+        self.local_context_start_iter = int(local_context_state.get("start_iter", self.local_context_start_iter))
+        self.local_context_chunk_size = max(1, int(local_context_state.get("chunk_size", self.local_context_chunk_size)))
+        if not self._local_context_modules_match(self.local_context_dim):
+            self.init_local_context_modules(self.local_context_dim)
+        if local_context_state.get("message_mlp") is not None:
+            self.local_context_message_mlp.load_state_dict(local_context_state["message_mlp"])
+        if local_context_state.get("fuse_mlp") is not None:
+            self.local_context_fuse_mlp.load_state_dict(local_context_state["fuse_mlp"])
+        if local_context_state.get("color_mlp") is not None:
+            self.local_context_color_mlp.load_state_dict(local_context_state["color_mlp"])
+        self.local_context_neighbor_indices = torch.empty((0, 0), device="cuda", dtype=torch.long)
+        self.local_context_active = self.local_context_active and self.local_context_enabled
+
     def get_module_state(self):
         module_state = {
             "mlp_opacity": self.mlp_opacity.state_dict(),
             "mlp_cov": self.mlp_cov.state_dict(),
             "color_mlp": self.mlp_color_fallback.state_dict(),
+            "local_context": self.get_local_context_state(),
         }
         if self.has_semantic_color_experts():
             module_state["color_expert_mlps"] = self.get_color_expert_state()
@@ -760,6 +984,8 @@ class GaussianModel:
             self.warm_start_color_modules(module_state["mlp_color_fallback"])
         if "color_expert_mlps" in module_state:
             self.load_color_expert_state(module_state["color_expert_mlps"], self.mlp_color_fallback.state_dict())
+        if "local_context" in module_state:
+            self.load_local_context_state(module_state["local_context"])
 
         if self.use_feat_bank and "feature_bank_mlp" in module_state:
             self.mlp_feature_bank.load_state_dict(module_state["feature_bank_mlp"])
@@ -774,6 +1000,9 @@ class GaussianModel:
             expert.eval()
         if self.semantic_adapter is not None:
             self.semantic_adapter.eval()
+        for module in [self.local_context_message_mlp, self.local_context_fuse_mlp, self.local_context_color_mlp]:
+            if module is not None:
+                module.eval()
         if self.appearance_dim > 0:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
@@ -787,6 +1016,9 @@ class GaussianModel:
             expert.train()
         if self.semantic_adapter is not None:
             self.semantic_adapter.train()
+        for module in [self.local_context_message_mlp, self.local_context_fuse_mlp, self.local_context_color_mlp]:
+            if module is not None:
+                module.train()
         if self.appearance_dim > 0:
             self.embedding_appearance.train()
         if self.use_feat_bank:                  
@@ -1028,6 +1260,7 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.set_triangle_hyperparams(training_args)
         self.semantic_expert_blend = float(getattr(training_args, "semantic_expert_blend", self.semantic_expert_blend))
+        self.configure_local_context(training_args)
         self.ensure_semantic_color_experts()
         if self._anchor_sem_feat.dim() != 2 or self._anchor_sem_feat.shape[0] != self.get_anchor.shape[0]:
             self._anchor_sem_feat = self._build_aligned_anchor_sem_feat(self.get_anchor.shape[0], self._anchor_sem_feat)
@@ -1061,6 +1294,11 @@ class GaussianModel:
         if self.semantic_adapter is not None:
             l.append({'params': self.semantic_adapter.parameters(), 'lr': training_args.semantic_adapter_lr, "name": "semantic_adapter"})
         l.append({'params': [self._anchor_sem_feat], 'lr': training_args.feature_lr, "name": "anchor_sem_feat"})
+        if self.local_context_enabled:
+            local_context_params = list(self.local_context_message_mlp.parameters())
+            local_context_params += list(self.local_context_fuse_mlp.parameters())
+            local_context_params += list(self.local_context_color_mlp.parameters())
+            l.append({'params': local_context_params, 'lr': getattr(training_args, "local_context_lr_init", training_args.mlp_color_lr_init), "name": "local_context_mlp"})
         if self._triangle_ctrl.shape[0] > 0:
             self._configure_triangle_scheduler_args(training_args)
             l.extend([
@@ -1106,6 +1344,13 @@ class GaussianModel:
             self.semantic_adapter_scheduler_args = get_expon_lr_func(lr_init=training_args.semantic_adapter_lr,
                                                                     lr_final=training_args.semantic_adapter_lr,
                                                                     max_steps=training_args.position_lr_max_steps)
+        if self.local_context_enabled:
+            self.local_context_scheduler_args = get_expon_lr_func(
+                lr_init=getattr(training_args, "local_context_lr_init", training_args.mlp_color_lr_init),
+                lr_final=getattr(training_args, "local_context_lr_final", training_args.mlp_color_lr_final),
+                lr_delay_mult=getattr(training_args, "mlp_color_lr_delay_mult", 0.01),
+                max_steps=getattr(training_args, "mlp_color_lr_max_steps", getattr(training_args, "iterations", 30000)),
+            )
         if self._triangle_ctrl.shape[0] > 0 and self.triangle_ctrl_scheduler_args is None:
             self._configure_triangle_scheduler_args(training_args)
 
@@ -1129,6 +1374,8 @@ class GaussianModel:
                 param_group['lr'] = self.appearance_scheduler_args(iteration)
             if self.semantic_adapter is not None and param_group["name"] == "semantic_adapter":
                 param_group['lr'] = self.semantic_adapter_scheduler_args(iteration)
+            if self.local_context_enabled and param_group["name"] == "local_context_mlp":
+                param_group['lr'] = self.local_context_scheduler_args(iteration)
             if self._triangle_ctrl.shape[0] > 0 and param_group["name"] == "triangle_ctrl":
                 param_group['lr'] = self.triangle_ctrl_scheduler_args(iteration)
             if self._triangle_ctrl.shape[0] > 0 and param_group["name"] == "triangle_alpha":
@@ -1470,6 +1717,7 @@ class GaussianModel:
             torch.save(self.get_color_expert_state(), os.path.join(path, 'color_expert_mlps.pth'))
             torch.save(self.get_semantic_routing_state(), os.path.join(path, 'semantic_routing_state.pth'))
             torch.save(self.get_triangle_state(), os.path.join(path, 'triangle_state.pth'))
+            torch.save(self.get_local_context_state(), os.path.join(path, 'local_context_state.pth'))
         elif mode == 'unite':
             data = {
                 'opacity_mlp': self.mlp_opacity.state_dict(),
@@ -1478,6 +1726,7 @@ class GaussianModel:
                 'color_expert_mlps': self.get_color_expert_state(),
                 'semantic_routing_state': self.get_semantic_routing_state(),
                 'triangle_state': self.get_triangle_state(),
+                'local_context': self.get_local_context_state(),
             }
             if self.use_feat_bank: data['feature_bank_mlp'] = self.mlp_feature_bank.state_dict()
             if self.appearance_dim > 0: data['appearance'] = self.embedding_appearance.state_dict()
@@ -1510,6 +1759,11 @@ class GaussianModel:
                 self.load_triangle_state(torch.load(triangle_state_path, map_location='cuda'))
             else:
                 self.reset_triangle_state(self.triangle_semantic_dim)
+            local_context_state_path = os.path.join(path, 'local_context_state.pth')
+            if os.path.exists(local_context_state_path):
+                self.load_local_context_state(torch.load(local_context_state_path, map_location='cuda'))
+            else:
+                self.load_local_context_state(None)
             if self.use_feat_bank: self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0: self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
         elif mode == 'unite':
@@ -1517,5 +1771,6 @@ class GaussianModel:
             self.load_semantic_routing_state(ckpt.get('semantic_routing_state'))
             self.load_module_state(ckpt)
             self.load_triangle_state(ckpt.get('triangle_state'))
+            self.load_local_context_state(ckpt.get('local_context'))
             if self.use_feat_bank: self.mlp_feature_bank.load_state_dict(ckpt['feature_bank_mlp'])
             if self.appearance_dim > 0: self.embedding_appearance.load_state_dict(ckpt['appearance'])
