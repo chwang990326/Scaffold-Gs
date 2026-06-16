@@ -873,7 +873,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     boundary_mask_cache = {}
     center_weight_cache = {}
     # 1. 初始化高斯模型
-    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
+    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank,
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.semantic_num_experts)
     # 2. 加载场景
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
@@ -1499,9 +1499,12 @@ def log_fps_stats(name, timings, logger):
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, opt=None, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
+        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank,
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.semantic_num_experts)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        if opt is not None:
+            gaussians.semantic_expert_blend = float(getattr(opt, "semantic_expert_blend", gaussians.semantic_expert_blend))
+            gaussians.configure_local_context(opt)
         gaussians.eval()
         if getattr(gaussians, "local_context_enabled", False):
             gaussians.build_local_context_neighbors(logger=logger)

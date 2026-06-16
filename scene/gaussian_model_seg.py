@@ -340,6 +340,7 @@ class GaussianModel:
             "semantic_valid_mask": self._semantic_valid_mask,
             "semantic_confidence": self._semantic_confidence,
             "semantic_num_experts": self.semantic_num_experts,
+            "semantic_expert_blend": self.semantic_expert_blend,
             "semantic_routing_initialized": self.semantic_routing_initialized,
         }
 
@@ -362,6 +363,9 @@ class GaussianModel:
             self.init_semantic_color_modules()
         else:
             self.ensure_semantic_color_experts()
+
+        if routing_state.get("semantic_expert_blend") is not None:
+            self.semantic_expert_blend = float(routing_state.get("semantic_expert_blend"))
 
         self.set_semantic_routing(
             cluster_ids=routing_state.get("semantic_cluster_ids"),
