@@ -388,11 +388,12 @@ def log_effective_method_config(dataset, opt, triangle_branch_enabled, logger):
     if logger is None:
         return
     logger.info(
-        "[METHOD] effective=%s profile=%s experts=%d expert_blend=%.3f "
+        "[METHOD] effective=%s profile=%s experts=%d auto_experts=%s expert_blend=%.3f "
         "xyz_weight=%.3f boundary_weight=%.4f triangle_enabled=%s",
         get_effective_method_name(dataset, opt, triangle_branch_enabled),
         getattr(opt, "method_profile", "manual"),
         int(getattr(dataset, "semantic_num_experts", 1)),
+        bool(getattr(opt, "semantic_auto_experts", False)),
         float(getattr(opt, "semantic_expert_blend", 0.25)),
         float(getattr(opt, "semantic_cluster_xyz_weight", 0.15)),
         float(getattr(opt, "boundary_loss_weight", 0.0)),
@@ -464,6 +465,206 @@ def sanitize_boundary_candidates(boundary_candidates, anchor_count, device="cuda
     for key in ["confidence", "view_counts", "angle_stability", "depth_stability", "center_weight"]:
         sanitized[key] = sanitized[key].to(dtype=torch.float32)
     return sanitized
+
+
+def _normalize_numpy_features(features, eps=1e-8):
+    norm = np.linalg.norm(features, axis=1, keepdims=True)
+    return features / np.maximum(norm, eps)
+
+
+def _standardize_numpy_features(features, eps=1e-6):
+    return (features - features.mean(axis=0, keepdims=True)) / np.maximum(features.std(axis=0, keepdims=True), eps)
+
+
+def _remap_cluster_labels(labels):
+    labels = np.asarray(labels, dtype=np.int64)
+    remapped = np.full_like(labels, -1)
+    unique_labels = sorted(int(label) for label in np.unique(labels) if int(label) >= 0)
+    for new_label, old_label in enumerate(unique_labels):
+        remapped[labels == old_label] = new_label
+    return remapped, len(unique_labels)
+
+
+def _merge_auto_expert_clusters(base_labels, semantic_np, appearance_np, xyz_np, opt, logger=None):
+    min_experts = max(1, int(getattr(opt, "semantic_auto_min_experts", 4)))
+    max_experts = max(min_experts, int(getattr(opt, "semantic_auto_max_experts", 16)))
+    target_experts = int(getattr(opt, "semantic_auto_target_experts", 0))
+    if target_experts > 0:
+        target_experts = min(max(target_experts, min_experts), max_experts)
+    merge_threshold = float(getattr(opt, "semantic_auto_merge_threshold", 0.86))
+    total_count = max(1, int(base_labels.shape[0]))
+    min_cluster_size = max(1, int(getattr(opt, "semantic_auto_min_cluster_size", 256)))
+    min_cluster_ratio = max(0.0, float(getattr(opt, "semantic_auto_min_cluster_ratio", 0.0)))
+    if min_cluster_ratio > 0.0:
+        min_cluster_size = max(min_cluster_size, int(round(total_count * min_cluster_ratio)))
+    force_small_merge = bool(getattr(opt, "semantic_auto_force_small_merge", False))
+    sem_weight = max(0.0, float(getattr(opt, "semantic_auto_sem_weight", 0.60)))
+    color_weight = max(0.0, float(getattr(opt, "semantic_auto_color_weight", 0.30)))
+    xyz_weight = max(0.0, float(getattr(opt, "semantic_auto_xyz_weight", 0.10)))
+    total_weight = max(sem_weight + color_weight + xyz_weight, 1e-6)
+    sem_weight /= total_weight
+    color_weight /= total_weight
+    xyz_weight /= total_weight
+
+    unique_labels = sorted(int(label) for label in np.unique(base_labels) if int(label) >= 0)
+    clusters = []
+    for label in unique_labels:
+        member_indices = np.flatnonzero(base_labels == label)
+        if member_indices.size == 0:
+            continue
+        clusters.append({
+            "members": member_indices,
+            "size": int(member_indices.size),
+            "semantic": _normalize_numpy_features(semantic_np[member_indices].mean(axis=0, keepdims=True))[0],
+            "appearance": _normalize_numpy_features(appearance_np[member_indices].mean(axis=0, keepdims=True))[0],
+            "xyz": xyz_np[member_indices].mean(axis=0),
+        })
+
+    stop_experts = target_experts if target_experts > 0 else min_experts
+    if len(clusters) <= stop_experts:
+        return _remap_cluster_labels(base_labels)
+
+    xyz_centers = np.stack([cluster["xyz"] for cluster in clusters], axis=0)
+    xyz_scale = np.linalg.norm(xyz_centers.std(axis=0)) + 1e-6
+
+    def recompute_cluster(cluster):
+        member_indices = cluster["members"]
+        cluster["size"] = int(member_indices.size)
+        cluster["semantic"] = _normalize_numpy_features(semantic_np[member_indices].mean(axis=0, keepdims=True))[0]
+        cluster["appearance"] = _normalize_numpy_features(appearance_np[member_indices].mean(axis=0, keepdims=True))[0]
+        cluster["xyz"] = xyz_np[member_indices].mean(axis=0)
+
+    def pair_score(cluster_a, cluster_b):
+        sem_sim = float(np.dot(cluster_a["semantic"], cluster_b["semantic"]))
+        appearance_sim = float(np.dot(cluster_a["appearance"], cluster_b["appearance"]))
+        xyz_dist = float(np.linalg.norm(cluster_a["xyz"] - cluster_b["xyz"]) / xyz_scale)
+        xyz_sim = math.exp(-xyz_dist)
+        return sem_weight * sem_sim + color_weight * appearance_sim + xyz_weight * xyz_sim
+
+    last_best_score = None
+    small_merge_count = 0
+    forced_target_merge_count = 0
+
+    while len(clusters) > stop_experts:
+        best_i = -1
+        best_j = -1
+        best_score = -float("inf")
+        best_raw_score = None
+        best_small_i = -1
+        best_small_j = -1
+        best_small_score = -float("inf")
+        best_small_raw_score = None
+
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                raw_score = pair_score(clusters[i], clusters[j])
+                score = raw_score
+                smaller_size = min(clusters[i]["size"], clusters[j]["size"])
+                if smaller_size < min_cluster_size:
+                    score += 0.05
+                if score > best_score:
+                    best_score = score
+                    best_raw_score = raw_score
+                    best_i = i
+                    best_j = j
+                if smaller_size < min_cluster_size and score > best_small_score:
+                    best_small_score = score
+                    best_small_raw_score = raw_score
+                    best_small_i = i
+                    best_small_j = j
+
+        if best_i < 0 or best_j < 0:
+            break
+        below_target = target_experts > 0 and len(clusters) > target_experts
+        above_max = len(clusters) > max_experts
+        threshold_merge = best_score >= merge_threshold
+        should_force_small = force_small_merge and best_small_i >= 0 and len(clusters) > stop_experts
+        if len(clusters) <= max_experts and not threshold_merge and not below_target and not should_force_small:
+            break
+
+        merge_i = best_i
+        merge_j = best_j
+        last_best_score = best_raw_score
+        if not above_max and not below_target and not threshold_merge and should_force_small:
+            merge_i = best_small_i
+            merge_j = best_small_j
+            last_best_score = best_small_raw_score
+            small_merge_count += 1
+        elif below_target:
+            forced_target_merge_count += 1
+
+        clusters[merge_i]["members"] = np.concatenate([clusters[merge_i]["members"], clusters[merge_j]["members"]])
+        recompute_cluster(clusters[merge_i])
+        del clusters[merge_j]
+
+    merged_labels = np.full_like(base_labels, -1, dtype=np.int64)
+    for label, cluster in enumerate(clusters):
+        merged_labels[cluster["members"]] = label
+
+    remapped_labels, final_count = _remap_cluster_labels(merged_labels)
+    if logger:
+        logger.info(
+            "[SEMANTIC][AUTO] Auto expert merge selected %d experts "
+            "(min=%d, max=%d, target=%d, threshold=%.3f, min_cluster_size=%d, "
+            "small_merges=%d, target_merges=%d, last_pair_score=%s).",
+            final_count,
+            min_experts,
+            max_experts,
+            target_experts,
+            merge_threshold,
+            min_cluster_size,
+            small_merge_count,
+            forced_target_merge_count,
+            "none" if last_best_score is None else f"{last_best_score:.4f}",
+        )
+    return remapped_labels, final_count
+
+
+def build_transductive_training_cameras(scene, opt, dataset, logger=None):
+    train_cameras = scene.getTrainCameras().copy()
+    if not bool(getattr(opt, "transductive_train_test_views", False)):
+        return train_cameras, []
+
+    test_cameras = scene.getTestCameras().copy()
+    if len(test_cameras) == 0:
+        if logger:
+            logger.warning("[TRANSDUCTIVE] Requested test-view training, but no test cameras were found.")
+        return train_cameras, []
+
+    requested_count = int(getattr(opt, "transductive_test_view_count", 0))
+    if requested_count <= 0:
+        ratio = max(0.0, min(1.0, float(getattr(opt, "transductive_test_view_ratio", 0.25))))
+        requested_count = int(round(len(test_cameras) * ratio))
+    requested_count = max(0, min(requested_count, len(test_cameras)))
+    if requested_count == 0:
+        if logger:
+            logger.warning("[TRANSDUCTIVE] Requested test-view training resolved to 0 views.")
+        return train_cameras, []
+
+    rng = np.random.default_rng(int(getattr(opt, "transductive_test_view_seed", 42)))
+    selected_indices = sorted(rng.choice(len(test_cameras), size=requested_count, replace=False).tolist())
+    selected_test_cameras = [test_cameras[idx] for idx in selected_indices]
+    selected_names = [getattr(camera, "image_name", f"test_{idx}") for idx, camera in zip(selected_indices, selected_test_cameras)]
+
+    os.makedirs(dataset.model_path, exist_ok=True)
+    manifest_path = os.path.join(dataset.model_path, "transductive_test_views.json")
+    with open(manifest_path, "w") as fp:
+        json.dump(
+            {
+                "enabled": True,
+                "count": len(selected_test_cameras),
+                "total_test_views": len(test_cameras),
+                "seed": int(getattr(opt, "transductive_test_view_seed", 42)),
+                "indices": selected_indices,
+                "image_names": selected_names,
+            },
+            fp,
+            indent=2,
+        )
+    if logger:
+        logger.info("[TRANSDUCTIVE] Manifest saved to %s", manifest_path)
+
+    return train_cameras + selected_test_cameras, selected_names
 
 
 def project_points_to_image(viewpoint_camera, points):
@@ -812,7 +1013,12 @@ def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
     else:
         valid_mask = torch.zeros((num_anchors,), device="cuda", dtype=torch.bool)
 
+    auto_experts = bool(getattr(opt, "semantic_auto_experts", False))
     requested_experts = max(1, int(getattr(dataset, "semantic_num_experts", 1)))
+    auto_min_experts = max(1, int(getattr(opt, "semantic_auto_min_experts", 4)))
+    auto_max_experts = max(auto_min_experts, int(getattr(opt, "semantic_auto_max_experts", requested_experts)))
+    if auto_experts:
+        requested_experts = auto_max_experts
     confidence_threshold = float(getattr(opt, "semantic_confidence_threshold", 0.6))
     semantic_confidence = gaussians.semantic_confidence
     if semantic_confidence.dim() != 1 or semantic_confidence.shape[0] != num_anchors:
@@ -838,11 +1044,21 @@ def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
     anchor_xyz = anchor_xyz - anchor_xyz.mean(dim=0, keepdim=True)
     anchor_xyz = anchor_xyz / anchor_xyz.std(dim=0, keepdim=True).clamp_min(1e-6)
     xyz_weight = float(getattr(opt, "semantic_cluster_xyz_weight", 0.15))
-    cluster_features = torch.cat([semantic_cluster_features, xyz_weight * anchor_xyz], dim=1).detach().cpu().numpy()
+    if auto_experts:
+        appearance_features = F.normalize(gaussians.anchor_color_proxy[eligible_indices].detach(), p=2, dim=-1)
+        cluster_features = torch.cat(
+            [semantic_cluster_features, appearance_features, xyz_weight * anchor_xyz],
+            dim=1,
+        ).detach().cpu().numpy()
+        overcluster_factor = max(1, int(getattr(opt, "semantic_auto_overcluster_factor", 3)))
+        initial_experts = min(max(auto_max_experts * overcluster_factor, auto_max_experts), int(eligible_indices.numel()))
+    else:
+        cluster_features = torch.cat([semantic_cluster_features, xyz_weight * anchor_xyz], dim=1).detach().cpu().numpy()
+        initial_experts = effective_experts
 
     batch_size = max(1, min(int(getattr(opt, "semantic_cluster_batch_size", 2048)), cluster_features.shape[0]))
     kmeans = MiniBatchKMeans(
-        n_clusters=effective_experts,
+        n_clusters=initial_experts,
         random_state=int(getattr(opt, "semantic_cluster_seed", 42)),
         batch_size=batch_size,
         n_init=3,
@@ -850,6 +1066,26 @@ def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
         reassignment_ratio=0.01,
     )
     predicted_labels = kmeans.fit_predict(cluster_features)
+    if auto_experts:
+        semantic_np = semantic_cluster_features.detach().cpu().numpy()
+        appearance_np = appearance_features.detach().cpu().numpy()
+        xyz_np = anchor_xyz.detach().cpu().numpy()
+        predicted_labels, effective_experts = _merge_auto_expert_clusters(
+            predicted_labels,
+            semantic_np,
+            appearance_np,
+            xyz_np,
+            opt,
+            logger,
+        )
+        fallback_state = gaussians.mlp_color_fallback.state_dict()
+        gaussians.semantic_num_experts = max(1, int(effective_experts))
+        dataset.semantic_num_experts = gaussians.semantic_num_experts
+        gaussians.init_semantic_color_modules()
+        gaussians.warm_start_color_modules(fallback_state)
+    else:
+        predicted_labels, effective_experts = _remap_cluster_labels(predicted_labels)
+
     cluster_ids[eligible_indices] = torch.from_numpy(predicted_labels).to(device="cuda", dtype=torch.long)
     gaussians.set_semantic_routing(cluster_ids, valid_mask, initialized=True)
 
@@ -860,10 +1096,12 @@ def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
         cluster_sizes = [int((cluster_ids == expert_idx).sum().item()) for expert_idx in range(effective_experts)]
         logger.info(
             f"[SEMANTIC] Enabled {effective_experts} semantic color experts "
-            f"(requested={requested_experts}, valid={valid_count}, high_conf={eligible_count}, "
+            f"(requested={requested_experts}, auto={auto_experts}, initial={initial_experts}, "
+            f"valid={valid_count}, high_conf={eligible_count}, "
             f"fallback={fallback_count})."
         )
         logger.info(f"[SEMANTIC] Expert cluster sizes: {cluster_sizes}")
+        logger.info(f"[SEMANTIC] FINAL_EXPERTS={effective_experts}")
 
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sam_checkpoint, clip_model_path, wandb=None, logger=None, ply_path=None):
@@ -977,7 +1215,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         )
         if not triangle_branch_enabled:
             boundary_candidates = None
-        
+
+        os.makedirs(dataset.model_path, exist_ok=True)
         torch.save(gaussians.semantic_features, sem_save_path)
         torch.save(gaussians.semantic_confidence, sem_conf_save_path)
         if triangle_branch_enabled and boundary_candidates is not None:
@@ -1048,12 +1287,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     if gaussians.semantic_features.dim() == 2 and gaussians.semantic_features.shape[1] > 0:
         gaussians.init_semantic_adapter(gaussians.semantic_features.shape[1])
 
-    gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
-    if not gaussians.semantic_routing_initialized:
-        initialize_semantic_routing(gaussians, dataset, opt, logger)
+    else:
+        if not gaussians.semantic_routing_initialized:
+            initialize_semantic_routing(gaussians, dataset, opt, logger)
+        gaussians.training_setup(opt)
 
     def render_fn(viewpoint_camera, gaussian_model, pipeline, bg_color, **kwargs):
         return hybrid_render(viewpoint_camera, gaussian_model, pipeline, bg_color, opt, **kwargs)
@@ -1093,6 +1333,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
+    training_cameras, transductive_test_view_names = build_transductive_training_cameras(scene, opt, dataset, logger)
+    if len(training_cameras) == 0:
+        raise RuntimeError("No training cameras available.")
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -1148,7 +1391,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gaussians.update_learning_rate(iteration)
 
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_stack = training_cameras.copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         if (iteration - 1) == debug_from:
@@ -1675,6 +1918,26 @@ def apply_method_profile(args, argv):
         _set_profile_default(args, argv, "enable_triangle_branch", False, changes)
         return changes
 
+    if profile == "semantic_auto_expert":
+        _set_profile_default(args, argv, "semantic_auto_experts", True, changes)
+        _set_profile_default(args, argv, "semantic_auto_target_experts", 0, changes)
+        _set_profile_default(args, argv, "semantic_auto_min_experts", 4, changes)
+        _set_profile_default(args, argv, "semantic_auto_max_experts", 16, changes)
+        _set_profile_default(args, argv, "semantic_auto_overcluster_factor", 3, changes)
+        _set_profile_default(args, argv, "semantic_auto_sem_weight", 0.60, changes)
+        _set_profile_default(args, argv, "semantic_auto_color_weight", 0.30, changes)
+        _set_profile_default(args, argv, "semantic_auto_xyz_weight", 0.10, changes)
+        _set_profile_default(args, argv, "semantic_auto_merge_threshold", 0.76, changes)
+        _set_profile_default(args, argv, "semantic_auto_min_cluster_size", 1024, changes)
+        _set_profile_default(args, argv, "semantic_auto_min_cluster_ratio", 0.02, changes)
+        _set_profile_default(args, argv, "semantic_auto_force_small_merge", True, changes)
+        _set_profile_default(args, argv, "semantic_num_experts", 16, changes)
+        _set_profile_default(args, argv, "semantic_expert_blend", 0.5, changes)
+        _set_profile_default(args, argv, "semantic_cluster_xyz_weight", 0.15, changes)
+        _set_profile_default(args, argv, "boundary_loss_weight", 0.0, changes)
+        _set_profile_default(args, argv, "enable_triangle_branch", False, changes)
+        return changes
+
     if profile == "semantic_shared_clean":
         _set_profile_default(args, argv, "semantic_num_experts", 1, changes)
         _set_profile_default(args, argv, "boundary_loss_weight", 0.0, changes)
@@ -1712,7 +1975,8 @@ def apply_method_profile(args, argv):
     raise ValueError(
         f"Unknown method_profile '{profile}'. Choose one of: manual, "
         "semantic_expert_clean, semantic_expert_strong_8_b05, "
-        "semantic_expert_strong_8_b10, semantic_shared_clean, boundary_shared, "
+        "semantic_expert_strong_8_b10, semantic_auto_expert, "
+        "semantic_shared_clean, boundary_shared, "
         "hybrid_late_triangle."
     )
 

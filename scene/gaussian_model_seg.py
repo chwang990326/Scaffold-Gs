@@ -88,6 +88,7 @@ class GaussianModel:
         self._semantic_confidence = torch.empty(0, device="cuda")
         self._semantic_cluster_ids = torch.empty(0, device="cuda", dtype=torch.long)
         self._semantic_valid_mask = torch.empty(0, device="cuda", dtype=torch.bool)
+        self._anchor_color_proxy = torch.empty(0, 3, device="cuda")
         self.semantic_routing_initialized = False
         self.semantic_adapter = None
         self.semantic_adapter_scheduler_args = None
@@ -326,6 +327,55 @@ class GaussianModel:
             aligned_features[:min_len] = source_features[:min_len].to(device="cuda", dtype=torch.float32)
             return nn.Parameter(aligned_features.requires_grad_(True))
         return nn.Parameter(torch.zeros((num_anchors, self.feat_dim), device="cuda").requires_grad_(True))
+
+    def _build_aligned_anchor_color_proxy(self, num_anchors: int, source_colors=None):
+        aligned_colors = torch.zeros((num_anchors, 3), device="cuda", dtype=torch.float32)
+        if source_colors is not None and source_colors.dim() == 2 and source_colors.shape[1] == 3 and source_colors.shape[0] > 0:
+            min_len = min(num_anchors, source_colors.shape[0])
+            aligned_colors[:min_len] = source_colors[:min_len].to(device="cuda", dtype=torch.float32).clamp(0.0, 1.0)
+        return aligned_colors
+
+    def _compute_voxel_color_proxy(self, source_points, source_colors, anchor_points, voxel_size):
+        default_colors = np.zeros((anchor_points.shape[0], 3), dtype=np.float32)
+        if source_colors is None or len(source_colors) != len(source_points) or anchor_points.shape[0] == 0:
+            return default_colors
+
+        source_points = np.asarray(source_points, dtype=np.float64)
+        source_colors = np.asarray(source_colors, dtype=np.float32)
+        if source_colors.ndim != 2 or source_colors.shape[1] < 3:
+            return default_colors
+
+        source_colors = source_colors[:, :3]
+        if source_colors.max(initial=0.0) > 1.0:
+            source_colors = source_colors / 255.0
+        source_colors = np.clip(source_colors, 0.0, 1.0)
+
+        source_keys = np.round(source_points / voxel_size).astype(np.int64)
+        anchor_keys = np.round(np.asarray(anchor_points, dtype=np.float64) / voxel_size).astype(np.int64)
+        unique_keys, inverse = np.unique(source_keys, axis=0, return_inverse=True)
+        color_sums = np.zeros((unique_keys.shape[0], 3), dtype=np.float64)
+        np.add.at(color_sums, inverse, source_colors)
+        counts = np.bincount(inverse, minlength=unique_keys.shape[0]).astype(np.float64)
+        mean_colors = (color_sums / np.maximum(counts[:, None], 1.0)).astype(np.float32)
+
+        order = np.lexsort((unique_keys[:, 2], unique_keys[:, 1], unique_keys[:, 0]))
+        sorted_keys = np.ascontiguousarray(unique_keys[order])
+        sorted_colors = mean_colors[order]
+
+        key_dtype = np.dtype((np.void, sorted_keys.dtype.itemsize * sorted_keys.shape[1]))
+        sorted_view = sorted_keys.view(key_dtype).reshape(-1)
+        anchor_view = np.ascontiguousarray(anchor_keys).view(key_dtype).reshape(-1)
+        match_indices = np.searchsorted(sorted_view, anchor_view)
+        valid = match_indices < sorted_view.shape[0]
+        valid[valid] = sorted_view[match_indices[valid]] == anchor_view[valid]
+        default_colors[valid] = sorted_colors[match_indices[valid]]
+        return default_colors
+
+    @property
+    def anchor_color_proxy(self):
+        if self._anchor_color_proxy.dim() != 2 or self._anchor_color_proxy.shape[0] != self.get_anchor.shape[0]:
+            self._anchor_color_proxy = self._build_aligned_anchor_color_proxy(self.get_anchor.shape[0], self._anchor_color_proxy)
+        return self._anchor_color_proxy
 
     def set_semantic_routing(self, cluster_ids=None, valid_mask=None, initialized=True):
         num_anchors = self._anchor.shape[0] if self._anchor.dim() > 0 else 0
@@ -964,6 +1014,7 @@ class GaussianModel:
             "mlp_cov": self.mlp_cov.state_dict(),
             "color_mlp": self.mlp_color_fallback.state_dict(),
             "local_context": self.get_local_context_state(),
+            "anchor_color_proxy": self.anchor_color_proxy.detach(),
         }
         if self.has_semantic_color_experts():
             module_state["color_expert_mlps"] = self.get_color_expert_state()
@@ -990,6 +1041,11 @@ class GaussianModel:
             self.load_color_expert_state(module_state["color_expert_mlps"], self.mlp_color_fallback.state_dict())
         if "local_context" in module_state:
             self.load_local_context_state(module_state["local_context"])
+        if "anchor_color_proxy" in module_state:
+            self._anchor_color_proxy = self._build_aligned_anchor_color_proxy(
+                self.get_anchor.shape[0],
+                module_state["anchor_color_proxy"],
+            )
 
         if self.use_feat_bank and "feature_bank_mlp" in module_state:
             self.mlp_feature_bank.load_state_dict(module_state["feature_bank_mlp"])
@@ -1222,7 +1278,15 @@ class GaussianModel:
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
-        points = pcd.points[::self.ratio]
+        source_points = np.asarray(pcd.points)
+        source_colors = np.asarray(pcd.colors) if pcd.colors is not None else None
+        points = np.asarray(source_points[::self.ratio]).copy()
+        colors = (
+            np.asarray(source_colors[::self.ratio]).copy()
+            if source_colors is not None and len(source_colors) == len(source_points)
+            else None
+        )
+        sampled_points_for_color = points.copy()
 
         if self.voxel_size <= 0:
             init_points = torch.tensor(points).float().cuda()
@@ -1235,6 +1299,12 @@ class GaussianModel:
 
         print(f'Initial voxel_size: {self.voxel_size}')
         points = self.voxelize_sample(points, voxel_size=self.voxel_size)
+        anchor_color_proxy = self._compute_voxel_color_proxy(
+            sampled_points_for_color,
+            colors,
+            points,
+            self.voxel_size,
+        )
         fused_point_cloud = torch.tensor(np.asarray(points)).float().cuda()
         offsets = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3)).float().cuda()
         anchors_feat = torch.zeros((fused_point_cloud.shape[0], self.feat_dim)).float().cuda()
@@ -1258,6 +1328,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
         self._semantic_confidence = torch.zeros((self.get_anchor.shape[0],), device="cuda", dtype=torch.float32)
+        self._anchor_color_proxy = torch.tensor(anchor_color_proxy, dtype=torch.float32, device="cuda")
         self.load_semantic_routing_state(None)
 
     def training_setup(self, training_args):
@@ -1270,6 +1341,8 @@ class GaussianModel:
             self._anchor_sem_feat = self._build_aligned_anchor_sem_feat(self.get_anchor.shape[0], self._anchor_sem_feat)
         if self._semantic_confidence.dim() != 1 or self._semantic_confidence.shape[0] != self.get_anchor.shape[0]:
             self._semantic_confidence = self._build_aligned_semantic_confidence(self.get_anchor.shape[0], self._semantic_confidence)
+        if self._anchor_color_proxy.dim() != 2 or self._anchor_color_proxy.shape[0] != self.get_anchor.shape[0]:
+            self._anchor_color_proxy = self._build_aligned_anchor_color_proxy(self.get_anchor.shape[0], self._anchor_color_proxy)
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
@@ -1512,6 +1585,12 @@ class GaussianModel:
             else:
                 self._semantic_confidence = torch.cat((self._semantic_confidence, tensors_dict["semantic_confidence"]), dim=0)
 
+        if "anchor_color_proxy" in tensors_dict:
+            if self._anchor_color_proxy.dim() != 2 or self._anchor_color_proxy.shape[0] == 0:
+                self._anchor_color_proxy = tensors_dict["anchor_color_proxy"]
+            else:
+                self._anchor_color_proxy = torch.cat((self._anchor_color_proxy, tensors_dict["anchor_color_proxy"]), dim=0)
+
         return optimizable_tensors
 
     def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
@@ -1559,6 +1638,8 @@ class GaussianModel:
             self._semantic_valid_mask = self._semantic_valid_mask[mask]
         if self._semantic_confidence.shape[0] > 0:
             self._semantic_confidence = self._semantic_confidence[mask]
+        if self._anchor_color_proxy.shape[0] > 0:
+            self._anchor_color_proxy = self._anchor_color_proxy[mask]
 
         return optimizable_tensors
 
@@ -1620,6 +1701,7 @@ class GaussianModel:
                 new_semantic_cluster_ids = torch.full((candidate_anchor.shape[0],), -1, device='cuda', dtype=torch.long)
                 new_semantic_valid_mask = torch.zeros((candidate_anchor.shape[0],), device='cuda', dtype=torch.bool)
                 new_semantic_confidence = torch.zeros((candidate_anchor.shape[0],), device='cuda', dtype=torch.float32)
+                new_anchor_color_proxy = torch.zeros((candidate_anchor.shape[0], 3), device='cuda', dtype=torch.float32)
                 candidate_indices = torch.nonzero(candidate_mask).view(-1)
                 parent_anchor_indices = candidate_indices // self.n_offsets
                 
@@ -1646,6 +1728,10 @@ class GaussianModel:
                     parent_confidence = self._semantic_confidence[parent_anchor_indices].unsqueeze(1)
                     reduced_confidence = scatter_max(parent_confidence, inverse_indices.unsqueeze(1), dim=0)[0][remove_duplicates]
                     new_semantic_confidence = reduced_confidence.squeeze(1)
+
+                if self._anchor_color_proxy.shape[0] > 0:
+                    parent_colors = self._anchor_color_proxy[parent_anchor_indices]
+                    new_anchor_color_proxy = scatter_max(parent_colors, inverse_indices.unsqueeze(1).expand(-1, 3), dim=0)[0][remove_duplicates]
                 # =================== [FIX END] ===================
 
                 d = {
@@ -1660,6 +1746,7 @@ class GaussianModel:
                     "semantic_cluster_ids": new_semantic_cluster_ids,
                     "semantic_valid_mask": new_semantic_valid_mask,
                     "semantic_confidence": new_semantic_confidence,
+                    "anchor_color_proxy": new_anchor_color_proxy,
                 }
                 
                 self.anchor_demon = torch.cat([self.anchor_demon, torch.zeros([candidate_anchor.shape[0], 1], device='cuda')], dim=0)
