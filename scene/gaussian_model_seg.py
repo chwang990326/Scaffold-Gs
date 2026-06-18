@@ -594,23 +594,37 @@ class GaussianModel:
     def predict_color(self, color_input, semantic_cluster_ids=None, visible_mask=None):
         if color_input.shape[0] == 0:
             return torch.empty((0, 3 * self.n_offsets), device=color_input.device, dtype=color_input.dtype)
-        base_color = self.mlp_color_fallback(color_input)
         if (
             not self.has_semantic_color_experts() or
             semantic_cluster_ids is None or
             semantic_cluster_ids.shape[0] != color_input.shape[0]
         ):
+            base_color = self.mlp_color_fallback(color_input)
             return self.apply_local_context_color(base_color, visible_mask)
 
         blend = float(max(0.0, min(1.0, self.semantic_expert_blend)))
         if blend <= 0.0:
+            base_color = self.mlp_color_fallback(color_input)
             return self.apply_local_context_color(base_color, visible_mask)
 
         semantic_cluster_ids = semantic_cluster_ids.to(device=color_input.device, dtype=torch.long).view(-1)
         valid_mask = (semantic_cluster_ids >= 0) & (semantic_cluster_ids < len(self.mlp_color_experts))
         if not valid_mask.any():
+            base_color = self.mlp_color_fallback(color_input)
             return self.apply_local_context_color(base_color, visible_mask)
 
+        if blend >= 1.0:
+            final_color = torch.empty((color_input.shape[0], 3 * self.n_offsets), device=color_input.device, dtype=color_input.dtype)
+            fallback_mask = ~valid_mask
+            if fallback_mask.any():
+                final_color[fallback_mask] = self.mlp_color_fallback(color_input[fallback_mask])
+            for expert_idx in torch.unique(semantic_cluster_ids[valid_mask]).tolist():
+                expert_idx = int(expert_idx)
+                expert_mask = semantic_cluster_ids == expert_idx
+                final_color[expert_mask] = self.mlp_color_experts[expert_idx](color_input[expert_mask])
+            return self.apply_local_context_color(final_color, visible_mask)
+
+        base_color = self.mlp_color_fallback(color_input)
         final_color = base_color.clone()
         for expert_idx in torch.unique(semantic_cluster_ids[valid_mask]).tolist():
             expert_idx = int(expert_idx)
@@ -1067,6 +1081,27 @@ class GaussianModel:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
+
+    def compile_color_modules_for_inference(self, logger=None):
+        if self.mlp_color_fallback.training:
+            return
+        input_dim = self.feat_dim + 3 + self.color_dist_dim + self.appearance_dim
+        example = torch.rand(1, input_dim, device="cuda")
+        try:
+            if not isinstance(self.mlp_color_fallback, torch.jit.ScriptModule):
+                self.mlp_color_fallback = torch.jit.trace(self.mlp_color_fallback, example).cuda().eval()
+            compiled_experts = []
+            for expert in self.mlp_color_experts:
+                if isinstance(expert, torch.jit.ScriptModule):
+                    compiled_experts.append(expert)
+                else:
+                    compiled_experts.append(torch.jit.trace(expert, example).cuda().eval())
+            self.mlp_color_experts = nn.ModuleList(compiled_experts)
+            if logger is not None:
+                logger.info("[EVAL] JIT-compiled semantic color modules for inference.")
+        except Exception as exc:
+            if logger is not None:
+                logger.warning(f"[EVAL] Failed to JIT-compile color modules; using eager modules. Error: {exc}")
 
     def train(self):
         self.mlp_opacity.train()

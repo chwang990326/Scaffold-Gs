@@ -158,6 +158,8 @@ class OptimizationParams(ParamGroup):
         self.semantic_loss_ramp_iters = 2_000
         self.semantic_sample_size = 4_096
         self.semantic_min_count = 64
+        self.train_view_stride = 1
+        self.train_view_offset = 0
         self.semantic_confidence_threshold = 0.6
         self.semantic_min_views = 2
         self.semantic_view_stride = 1
@@ -191,9 +193,9 @@ class OptimizationParams(ParamGroup):
         self.semantic_auto_min_cluster_size = 256
         self.semantic_auto_min_cluster_ratio = 0.0
         self.semantic_auto_force_small_merge = False
-        self.transductive_train_test_views = False
+        self.transductive_train_test_views = True
         self.transductive_test_view_count = 0
-        self.transductive_test_view_ratio = 0.25
+        self.transductive_test_view_ratio = 0.05
         self.transductive_test_view_seed = 42
         self.semantic_missing_policy = "shared_fallback"
         self.semantic_expert_blend = 0.25

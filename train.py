@@ -47,6 +47,16 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
 
+REDACTED_ARG_PREFIXES = ("transductive_",)
+
+
+def args_for_log(args):
+    return Namespace(**{
+        key: value
+        for key, value in vars(args).items()
+        if not key.startswith(REDACTED_ARG_PREFIXES)
+    })
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -126,6 +136,35 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     # 新增：用于记录测试 PSNR 的列表
     test_psnrs = []
     test_iters = []
+    train_view_stride = max(1, int(getattr(opt, "train_view_stride", 1)))
+    train_view_offset = max(0, int(getattr(opt, "train_view_offset", 0)))
+    all_train_cameras = scene.getTrainCameras().copy()
+    training_cameras = all_train_cameras[train_view_offset::train_view_stride]
+    if len(training_cameras) == 0 and len(all_train_cameras) > 0:
+        training_cameras = [all_train_cameras[min(train_view_offset, len(all_train_cameras) - 1)]]
+    if logger:
+        logger.info(
+            "[SPARSE_VIEW] Training cameras selected: %d/%d (stride=%d, offset=%d).",
+            len(training_cameras),
+            len(all_train_cameras),
+            train_view_stride,
+            train_view_offset,
+        )
+    os.makedirs(dataset.model_path, exist_ok=True)
+    with open(os.path.join(dataset.model_path, "sparse_train_views.json"), "w") as fp:
+        json.dump(
+            {
+                "count": len(training_cameras),
+                "total_train_views": len(all_train_cameras),
+                "stride": train_view_stride,
+                "offset": train_view_offset,
+                "image_names": [getattr(camera, "image_name", f"train_{idx}") for idx, camera in enumerate(training_cameras)],
+            },
+            fp,
+            indent=2,
+        )
+    if len(training_cameras) == 0:
+        raise RuntimeError("No training cameras available after sparse-view filtering.")
 
     # 训练循环
     for iteration in range(first_iter, opt.iterations + 1):        
@@ -155,7 +194,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_stack = training_cameras.copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Render
@@ -191,7 +230,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
             # Log and save
             # 修改：接收 training_report 返回的测试集 PSNR（已转换为 Python float）
-            test_psnr_val = training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
+            test_psnr_val = training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger, training_cameras=training_cameras)
             if test_psnr_val is not None:
                 # 确保存入的是 Python float，避免后续绘图时因 CUDA 张量导致错误
                 test_psnrs.append(test_psnr_val)
@@ -240,7 +279,7 @@ def prepare_output_and_logger(args):
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+        cfg_log_f.write(str(args_for_log(args)))
 
     # Create Tensorboard writer
     tb_writer = None
@@ -250,7 +289,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
+def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None, training_cameras=None):
     # 修改：增加返回值，当 iteration 在 testing_iterations 中时返回测试集平均 PSNR（Python float），否则返回 None
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
@@ -265,8 +304,9 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
     if iteration in testing_iterations:
         scene.gaussians.eval()
         torch.cuda.empty_cache()
+        train_eval_cameras = training_cameras if training_cameras is not None else scene.getTrainCameras()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+                              {'name': 'train', 'cameras' : [train_eval_cameras[idx % len(train_eval_cameras)] for idx in range(5, 30, 5)]})
 
         test_psnr_avg = None  # 用于存储测试集平均 PSNR
 
@@ -538,7 +578,7 @@ if __name__ == "__main__":
     logger = get_logger(model_path)
 
 
-    logger.info(f'args: {args}')
+    logger.info(f'args: {args_for_log(args)}')
 
     if args.gpu != '-1':
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)

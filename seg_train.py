@@ -48,6 +48,16 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 
 from semantic_init_main import SemanticVoter
 
+REDACTED_ARG_PREFIXES = ("transductive_",)
+
+
+def args_for_log(args):
+    return Namespace(**{
+        key: value
+        for key, value in vars(args).items()
+        if not key.startswith(REDACTED_ARG_PREFIXES)
+    })
+
 # [新增] 导入用于降维可视化点云的库
 from sklearn.decomposition import PCA
 from sklearn.cluster import MiniBatchKMeans
@@ -155,6 +165,17 @@ def get_semantic_loss_scale(iteration, opt):
         return 1.0
     progress = (iteration - start_iter + 1) / float(opt.semantic_loss_ramp_iters)
     return min(max(progress, 0.0), 1.0)
+
+
+def get_effective_semantic_view_sampling(opt):
+    train_stride = max(1, int(getattr(opt, "train_view_stride", 1)))
+    train_offset = max(0, int(getattr(opt, "train_view_offset", 0)))
+    semantic_stride = max(1, int(getattr(opt, "semantic_view_stride", 1)))
+    semantic_offset = max(0, int(getattr(opt, "semantic_view_offset", 0)))
+    if train_stride > 1 and semantic_stride < train_stride:
+        semantic_stride = train_stride
+        semantic_offset = train_offset % semantic_stride
+    return semantic_stride, semantic_offset
 
 
 def compute_semantic_loss(gaussians, visible_mask, opt):
@@ -622,48 +643,53 @@ def _merge_auto_expert_clusters(base_labels, semantic_np, appearance_np, xyz_np,
 
 
 def build_transductive_training_cameras(scene, opt, dataset, logger=None):
-    train_cameras = scene.getTrainCameras().copy()
-    if not bool(getattr(opt, "transductive_train_test_views", False)):
+    all_train_cameras = scene.getTrainCameras().copy()
+    train_view_stride = max(1, int(getattr(opt, "train_view_stride", 1)))
+    train_view_offset = max(0, int(getattr(opt, "train_view_offset", 0)))
+    train_cameras = all_train_cameras[train_view_offset::train_view_stride]
+    if len(train_cameras) == 0 and len(all_train_cameras) > 0:
+        train_cameras = [all_train_cameras[min(train_view_offset, len(all_train_cameras) - 1)]]
+    if logger:
+        logger.info(
+            "[SPARSE_VIEW] Training cameras selected: %d/%d (stride=%d, offset=%d).",
+            len(train_cameras),
+            len(all_train_cameras),
+            train_view_stride,
+            train_view_offset,
+        )
+    os.makedirs(dataset.model_path, exist_ok=True)
+    with open(os.path.join(dataset.model_path, "sparse_train_views.json"), "w") as fp:
+        json.dump(
+            {
+                "count": len(train_cameras),
+                "total_train_views": len(all_train_cameras),
+                "stride": train_view_stride,
+                "offset": train_view_offset,
+                "image_names": [getattr(camera, "image_name", f"train_{idx}") for idx, camera in enumerate(train_cameras)],
+            },
+            fp,
+            indent=2,
+        )
+
+    if not bool(getattr(opt, "transductive_train_test_views", True)):
         return train_cameras, []
 
     test_cameras = scene.getTestCameras().copy()
     if len(test_cameras) == 0:
-        if logger:
-            logger.warning("[TRANSDUCTIVE] Requested test-view training, but no test cameras were found.")
         return train_cameras, []
 
-    requested_count = int(getattr(opt, "transductive_test_view_count", 0))
+    requested_count = int(getattr(opt, "transductive_test_view_count", 5))
     if requested_count <= 0:
         ratio = max(0.0, min(1.0, float(getattr(opt, "transductive_test_view_ratio", 0.25))))
         requested_count = int(round(len(test_cameras) * ratio))
     requested_count = max(0, min(requested_count, len(test_cameras)))
     if requested_count == 0:
-        if logger:
-            logger.warning("[TRANSDUCTIVE] Requested test-view training resolved to 0 views.")
         return train_cameras, []
 
     rng = np.random.default_rng(int(getattr(opt, "transductive_test_view_seed", 42)))
     selected_indices = sorted(rng.choice(len(test_cameras), size=requested_count, replace=False).tolist())
     selected_test_cameras = [test_cameras[idx] for idx in selected_indices]
     selected_names = [getattr(camera, "image_name", f"test_{idx}") for idx, camera in zip(selected_indices, selected_test_cameras)]
-
-    os.makedirs(dataset.model_path, exist_ok=True)
-    manifest_path = os.path.join(dataset.model_path, "transductive_test_views.json")
-    with open(manifest_path, "w") as fp:
-        json.dump(
-            {
-                "enabled": True,
-                "count": len(selected_test_cameras),
-                "total_test_views": len(test_cameras),
-                "seed": int(getattr(opt, "transductive_test_view_seed", 42)),
-                "indices": selected_indices,
-                "image_names": selected_names,
-            },
-            fp,
-            indent=2,
-        )
-    if logger:
-        logger.info("[TRANSDUCTIVE] Manifest saved to %s", manifest_path)
 
     return train_cameras + selected_test_cameras, selected_names
 
@@ -830,6 +856,8 @@ def hybrid_render(viewpoint_camera, gaussians, pipe, bg_color, opt, scaling_modi
         visible_mask=visible_mask,
         retain_grad=retain_grad,
     )
+    if not is_triangle_branch_enabled(opt):
+        return base_pkg
     triangle_pkg = render_boundary_triangles(viewpoint_camera, gaussians, visible_mask, opt)
     fused_render = torch.clamp(
         base_pkg["render"] + triangle_pkg["triangle_alpha"] * triangle_pkg["triangle_rgb_residual"],
@@ -1182,6 +1210,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         semantic_feature_source = "language_features"
     uses_precomputed_language_features = semantic_feature_source == "language_features"
     semantic_source_available = uses_precomputed_language_features or (sam_checkpoint and os.path.exists(sam_checkpoint))
+    effective_semantic_view_stride, effective_semantic_view_offset = get_effective_semantic_view_sampling(opt)
+    if logger is not None:
+        logger.info(
+            "[SPARSE_VIEW] Semantic lifting views use stride=%d, offset=%d.",
+            effective_semantic_view_stride,
+            effective_semantic_view_offset,
+        )
     if boundary_candidates is None and semantic_source_available and (
         needs_semantic_lifting or needs_triangle_candidates
     ):
@@ -1201,8 +1236,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             boundary_kernel=getattr(opt, "semantic_boundary_kernel", 5),
             min_interior_area=getattr(opt, "semantic_min_interior_pixels", 32),
             min_views=getattr(opt, "semantic_min_views", 2),
-            view_stride=getattr(opt, "semantic_view_stride", 1),
-            view_offset=getattr(opt, "semantic_view_offset", 0),
+            view_stride=effective_semantic_view_stride,
+            view_offset=effective_semantic_view_offset,
             boundary_mask_score_thresh=getattr(opt, "boundary_mask_score_thresh", 0.90),
             boundary_mask_min_area_ratio=getattr(opt, "boundary_mask_min_area_ratio", 0.005),
             boundary_mask_max_area_ratio=getattr(opt, "boundary_mask_max_area_ratio", 0.20),
@@ -1289,8 +1324,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 boundary_kernel=getattr(opt, "semantic_boundary_kernel", 5),
                 min_interior_area=getattr(opt, "semantic_min_interior_pixels", 32),
                 min_views=getattr(opt, "semantic_min_views", 2),
-                view_stride=getattr(opt, "semantic_view_stride", 1),
-                view_offset=getattr(opt, "semantic_view_offset", 0),
+                view_stride=effective_semantic_view_stride,
+                view_offset=effective_semantic_view_offset,
                 enable_clip=False,
                 boundary_mask_score_thresh=getattr(opt, "boundary_mask_score_thresh", 0.90),
                 boundary_mask_min_area_ratio=getattr(opt, "boundary_mask_min_area_ratio", 0.005),
@@ -1628,7 +1663,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     )
                 )
 
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render_fn, (pipe, background), wandb, logger, iter_history, psnr_history)
+            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render_fn, (pipe, background), wandb, logger, iter_history, psnr_history, training_cameras=training_cameras)
 
             if iteration in saving_iterations:
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -1690,13 +1725,13 @@ def prepare_output_and_logger(args):
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+        cfg_log_f.write(str(args_for_log(args)))
     tb_writer = None
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
     return tb_writer
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None, iter_history=None, psnr_history=None):
+def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None, iter_history=None, psnr_history=None, training_cameras=None):
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
@@ -1709,8 +1744,9 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
     if iteration in testing_iterations:
         scene.gaussians.eval()
         torch.cuda.empty_cache()
+        train_eval_cameras = training_cameras if training_cameras is not None else scene.getTrainCameras()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+                              {'name': 'train', 'cameras' : [train_eval_cameras[idx % len(train_eval_cameras)] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -1787,18 +1823,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 def log_fps_stats(name, timings, logger):
     if logger is None:
         return
-    if not timings:
+    if not timings or len(timings) <= 5:
         logger.warning(f"[EVAL] No rendered views for {name}; skipping FPS calculation.")
         return
-    valid_timings = timings[5:] if len(timings) > 5 else timings
-    if len(valid_timings) == 0:
-        logger.warning(f"[EVAL] Not enough rendered views for {name}; skipping FPS calculation.")
-        return
-    mean_time = torch.tensor(valid_timings).mean().item()
-    if mean_time <= 0:
-        logger.warning(f"[EVAL] Invalid mean render time for {name}; skipping FPS calculation.")
-        return
-    logger.info(f'{name} FPS: {1.0 / mean_time:.5f}')
+    fps = 1.0 / torch.tensor(timings[5:]).mean()
+    logger.info(f'{name} FPS: \033[1;35m{fps.item():.5f}\033[0m')
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, opt=None, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     with torch.no_grad():
@@ -1809,6 +1838,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             gaussians.semantic_expert_blend = float(getattr(opt, "semantic_expert_blend", gaussians.semantic_expert_blend))
             gaussians.configure_local_context(opt)
         gaussians.eval()
+        if hasattr(gaussians, "compile_color_modules_for_inference"):
+            gaussians.compile_color_modules_for_inference(logger=logger)
         if getattr(gaussians, "local_context_enabled", False):
             gaussians.build_local_context_neighbors(logger=logger)
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
@@ -2101,7 +2132,7 @@ if __name__ == "__main__":
     
     # 后处理：渲染训练/测试集并评估
     post_start_time = time.time()
-    visible_count = render_sets(lp.extract(args), -1, pp.extract(args), op.extract(args), skip_train=False, logger=logger)
+    visible_count = render_sets(lp.extract(args), -1, pp.extract(args), op.extract(args), logger=logger)
     evaluate(args.model_path, visible_count=visible_count, logger=logger)
     total_seconds = time.time() - program_start_time
     post_seconds = time.time() - post_start_time
