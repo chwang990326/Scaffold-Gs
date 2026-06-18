@@ -164,6 +164,15 @@ class OptimizationParams(ParamGroup):
         self.semantic_view_offset = 0
         self.semantic_feature_source = "sam_clip"
         self.semantic_language_feature_level = 3
+        self.semantic_cluster_attach_enabled = False
+        self.semantic_attach_num_clusters = 256
+        self.semantic_attach_topk_views = 5
+        self.semantic_attach_min_views = 2
+        self.semantic_attach_min_score = 0.03
+        self.semantic_attach_min_points = 3
+        self.semantic_attach_blend = 0.7
+        self.semantic_attach_visibility_filter = False
+        self.semantic_attach_depth_epsilon = 0.03
         self.semantic_boundary_kernel = 5
         self.semantic_min_interior_pixels = 32
         self.method_profile = "manual"

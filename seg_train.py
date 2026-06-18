@@ -1216,6 +1216,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             transform_holdout=8 if getattr(dataset, "eval", False) else 0,
             semantic_feature_source=semantic_feature_source,
             language_feature_level=getattr(opt, "semantic_language_feature_level", 3),
+            cluster_attach_enabled=getattr(opt, "semantic_cluster_attach_enabled", False),
+            attach_num_clusters=getattr(opt, "semantic_attach_num_clusters", 256),
+            attach_topk_views=getattr(opt, "semantic_attach_topk_views", 5),
+            attach_min_views=getattr(opt, "semantic_attach_min_views", 2),
+            attach_min_score=getattr(opt, "semantic_attach_min_score", 0.03),
+            attach_min_points=getattr(opt, "semantic_attach_min_points", 3),
+            attach_blend=getattr(opt, "semantic_attach_blend", 0.7),
+            attach_visibility_filter=getattr(opt, "semantic_attach_visibility_filter", False),
+            attach_depth_epsilon=getattr(opt, "semantic_attach_depth_epsilon", 0.03),
         )
         semantic_result = voter.run(real_anchors)
         semantic_lifting_seconds = time.time() - semantic_start_time
@@ -1293,6 +1302,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 transform_holdout=8 if getattr(dataset, "eval", False) else 0,
                 semantic_feature_source=semantic_feature_source,
                 language_feature_level=getattr(opt, "semantic_language_feature_level", 3),
+                cluster_attach_enabled=getattr(opt, "semantic_cluster_attach_enabled", False),
+                attach_num_clusters=getattr(opt, "semantic_attach_num_clusters", 256),
+                attach_topk_views=getattr(opt, "semantic_attach_topk_views", 5),
+                attach_min_views=getattr(opt, "semantic_attach_min_views", 2),
+                attach_min_score=getattr(opt, "semantic_attach_min_score", 0.03),
+                attach_min_points=getattr(opt, "semantic_attach_min_points", 3),
+                attach_blend=getattr(opt, "semantic_attach_blend", 0.7),
+                attach_visibility_filter=getattr(opt, "semantic_attach_visibility_filter", False),
+                attach_depth_epsilon=getattr(opt, "semantic_attach_depth_epsilon", 0.03),
             )
             boundary_voter.export_stable_edge_masks()
             del boundary_voter

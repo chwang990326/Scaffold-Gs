@@ -16,6 +16,7 @@ from utils.graphics_utils import fov2focal
 
 # [新增] 导入 PCA
 from sklearn.decomposition import PCA
+from sklearn.cluster import MiniBatchKMeans
 
 # ==========================================
 # 1. COLMAP 数据读取模块 (保持不变)
@@ -324,6 +325,15 @@ class SemanticVoter:
         transform_holdout=0,
         semantic_feature_source="sam_clip",
         language_feature_level=3,
+        cluster_attach_enabled=False,
+        attach_num_clusters=256,
+        attach_topk_views=5,
+        attach_min_views=2,
+        attach_min_score=0.03,
+        attach_min_points=3,
+        attach_blend=0.7,
+        attach_visibility_filter=False,
+        attach_depth_epsilon=0.03,
     ):
         self.device = device
         self.scene_path = scene_path
@@ -366,6 +376,15 @@ class SemanticVoter:
         self.view_stride = max(1, int(view_stride))
         self.view_offset = max(0, int(view_offset))
         self.transform_holdout = max(0, int(transform_holdout))
+        self.cluster_attach_enabled = bool(cluster_attach_enabled)
+        self.attach_num_clusters = max(1, int(attach_num_clusters))
+        self.attach_topk_views = max(1, int(attach_topk_views))
+        self.attach_min_views = max(1, int(attach_min_views))
+        self.attach_min_score = float(attach_min_score)
+        self.attach_min_points = max(1, int(attach_min_points))
+        self.attach_blend = float(np.clip(float(attach_blend), 0.0, 1.0))
+        self.attach_visibility_filter = bool(attach_visibility_filter)
+        self.attach_depth_epsilon = max(0.0, float(attach_depth_epsilon))
         
         # [???] ?????? 2D ?????????????????
         self.mask_out_dir = os.path.join(scene_path, "semantic_masks_2d")
@@ -678,6 +697,133 @@ class SemanticVoter:
 
         return full_img_path, id_map, interior_id_map, id_to_feat, id_to_score, stable_edge_mask
 
+    def _build_attach_clusters(self, anchors):
+        num_anchors = anchors.shape[0]
+        num_clusters = min(self.attach_num_clusters, num_anchors)
+        if num_clusters <= 1:
+            labels = torch.zeros(num_anchors, device=self.device, dtype=torch.long)
+            return labels, 1
+
+        anchors_np = anchors.detach().cpu().numpy().astype(np.float32)
+        kmeans = MiniBatchKMeans(
+            n_clusters=num_clusters,
+            random_state=0,
+            batch_size=min(8192, max(1024, num_anchors)),
+            n_init=3,
+            max_iter=100,
+        )
+        labels_np = kmeans.fit_predict(anchors_np)
+        labels = torch.from_numpy(labels_np.astype(np.int64)).to(self.device)
+        return labels, num_clusters
+
+    def _visibility_filter_projected_points(self, u, v, depth, height, width):
+        if not self.attach_visibility_filter or u.numel() == 0:
+            return torch.ones_like(depth, dtype=torch.bool)
+
+        flat = v * width + u
+        order = torch.argsort(depth)
+        sorted_flat = flat[order]
+        sorted_depth = depth[order]
+        unique_flat, inverse = torch.unique_consecutive(sorted_flat, return_inverse=True)
+        min_depth = torch.full((unique_flat.shape[0],), float("inf"), device=self.device, dtype=depth.dtype)
+        min_depth.scatter_reduce_(0, inverse, sorted_depth, reduce="amin", include_self=True)
+        point_min_depth = min_depth[inverse]
+        visible_sorted = sorted_depth <= point_min_depth + self.attach_depth_epsilon
+        visible = torch.zeros_like(visible_sorted)
+        visible[order] = visible_sorted
+        return visible
+
+    def _accumulate_cluster_attach_matches(
+        self,
+        attach_matches,
+        attach_cluster_labels,
+        valid_indices,
+        sampled_ids,
+        id_to_feat,
+        id_to_score,
+        visible_points=None,
+    ):
+        if attach_cluster_labels is None or not id_to_feat:
+            return
+        if visible_points is not None:
+            keep = visible_points & (sampled_ids > 0)
+        else:
+            keep = sampled_ids > 0
+        if keep.sum().item() < self.attach_min_points:
+            return
+
+        point_clusters = attach_cluster_labels[valid_indices[keep]].long()
+        point_mask_ids = sampled_ids[keep].long()
+        unique_clusters = torch.unique(point_clusters)
+        for cluster_id_tensor in unique_clusters:
+            cluster_id = int(cluster_id_tensor.item())
+            cluster_point_mask = point_clusters == cluster_id_tensor
+            cluster_total = int(cluster_point_mask.sum().item())
+            if cluster_total < self.attach_min_points:
+                continue
+
+            mask_ids = point_mask_ids[cluster_point_mask]
+            unique_mask_ids, counts = torch.unique(mask_ids, return_counts=True)
+            best_count, best_pos = torch.max(counts, dim=0)
+            best_count_int = int(best_count.item())
+            if best_count_int < self.attach_min_points:
+                continue
+
+            best_mask_id = int(unique_mask_ids[best_pos].item())
+            if best_mask_id <= 0 or best_mask_id not in id_to_feat:
+                continue
+
+            mask_area = int((sampled_ids == best_mask_id).sum().item())
+            union = cluster_total + mask_area - best_count_int
+            if union <= 0:
+                continue
+
+            iou_score = float(best_count_int) / float(union)
+            score = iou_score * float(id_to_score.get(best_mask_id, 1.0))
+            if score < self.attach_min_score:
+                continue
+
+            attach_matches[cluster_id].append(
+                (
+                    score,
+                    id_to_feat[best_mask_id].detach(),
+                    best_count_int,
+                )
+            )
+
+    def _finalize_cluster_attach_features(self, attach_matches, attach_cluster_labels, num_anchors, feature_dim):
+        cluster_features = torch.zeros((len(attach_matches), feature_dim), device=self.device, dtype=torch.float32)
+        cluster_confidence = torch.zeros(len(attach_matches), device=self.device, dtype=torch.float32)
+        selected_clusters = 0
+        total_selected_views = 0
+
+        for cluster_id, matches in enumerate(attach_matches):
+            if len(matches) < self.attach_min_views:
+                continue
+            matches = sorted(matches, key=lambda item: item[0], reverse=True)[:self.attach_topk_views]
+            if len(matches) < self.attach_min_views:
+                continue
+            feats = torch.stack([item[1].to(self.device, dtype=torch.float32) for item in matches], dim=0)
+            weights = torch.tensor([item[0] for item in matches], device=self.device, dtype=torch.float32)
+            feat = torch.median(feats, dim=0).values
+            if feat.abs().sum() <= 0:
+                continue
+            cluster_features[cluster_id] = F.normalize(feat, p=2, dim=0)
+            cluster_confidence[cluster_id] = weights.mean().clamp(0.0, 1.0)
+            selected_clusters += 1
+            total_selected_views += len(matches)
+
+        anchor_cluster_features = cluster_features[attach_cluster_labels]
+        anchor_cluster_confidence = cluster_confidence[attach_cluster_labels]
+        anchor_cluster_mask = anchor_cluster_confidence > 0
+        print(
+            "[INFO] ClusterAttach selected "
+            f"{selected_clusters}/{len(attach_matches)} clusters, "
+            f"avg_topk_views={total_selected_views / max(selected_clusters, 1):.2f}, "
+            f"anchors={int(anchor_cluster_mask.sum().item())}/{num_anchors}."
+        )
+        return anchor_cluster_features, anchor_cluster_confidence, anchor_cluster_mask
+
     def export_stable_edge_masks(self):
         for img_key in tqdm(self.selected_image_keys, desc="Preparing Stable Edge Masks"):
             colmap_img = self.images[img_key]
@@ -700,6 +846,17 @@ class SemanticVoter:
         boundary_depth_sq_sums = torch.zeros(num_anchors, device=self.device)
         boundary_center_sums = torch.zeros(num_anchors, device=self.device)
         boundary_dir_sums = torch.zeros((num_anchors, 3), device=self.device)
+        attach_cluster_labels = None
+        attach_matches = None
+        attach_cluster_count = 0
+        if self.cluster_attach_enabled:
+            attach_cluster_labels, attach_cluster_count = self._build_attach_clusters(anchors)
+            attach_matches = [[] for _ in range(attach_cluster_count)]
+            print(
+                f"[INFO] ClusterAttach enabled: clusters={attach_cluster_count}, "
+                f"topk_views={self.attach_topk_views}, min_views={self.attach_min_views}, "
+                f"blend={self.attach_blend:.2f}, visibility_filter={self.attach_visibility_filter}"
+            )
         
         for img_key in tqdm(self.selected_image_keys, desc="Lifting Semantics"):
             colmap_img = self.images[img_key]
@@ -747,6 +904,23 @@ class SemanticVoter:
             boundary_depth = depth[valid_indices]
             camera_center = (-R.t() @ T).to(self.device)
             view_dirs = F.normalize(camera_center.unsqueeze(0) - anchors[valid_indices], dim=-1)
+            if self.cluster_attach_enabled and attach_matches is not None and attach_cluster_labels is not None:
+                visible_points = self._visibility_filter_projected_points(
+                    u[valid_indices],
+                    v[valid_indices],
+                    depth[valid_indices],
+                    h,
+                    w,
+                )
+                self._accumulate_cluster_attach_matches(
+                    attach_matches,
+                    attach_cluster_labels,
+                    valid_indices,
+                    sampled_ids,
+                    id_to_feat,
+                    id_to_score,
+                    visible_points=visible_points,
+                )
             
             for mid, feat in id_to_feat.items():
                 mask_in_img = (sampled_ids == mid)
@@ -778,7 +952,6 @@ class SemanticVoter:
         mask = anchor_score_sums > 0
         anchor_features[mask] /= anchor_score_sums[mask].unsqueeze(1)
         anchor_features[mask] = F.normalize(anchor_features[mask], p=2, dim=-1)
-        raw_anchor_features = anchor_features.detach().clone()
         boundary_mask = boundary_score_sums > 0
         boundary_features[boundary_mask] /= boundary_score_sums[boundary_mask].unsqueeze(1)
         boundary_features[boundary_mask] = F.normalize(boundary_features[boundary_mask], p=2, dim=-1)
@@ -790,6 +963,34 @@ class SemanticVoter:
             view_confidence = torch.clamp(anchor_view_counts / float(self.min_views), max=1.0)
             anchor_confidence = avg_score * view_confidence
             anchor_confidence[~mask] = 0.0
+
+        if self.cluster_attach_enabled and attach_matches is not None and attach_cluster_labels is not None:
+            cluster_features, cluster_confidence, cluster_mask = self._finalize_cluster_attach_features(
+                attach_matches,
+                attach_cluster_labels,
+                num_anchors,
+                anchor_features.shape[1],
+            )
+            if cluster_mask.any():
+                anchor_cluster_features = cluster_features
+                anchor_cluster_confidence = cluster_confidence
+                blended_mask = cluster_mask & mask
+                if blended_mask.any():
+                    blended = (
+                        (1.0 - self.attach_blend) * anchor_features[blended_mask]
+                        + self.attach_blend * anchor_cluster_features[blended_mask]
+                    )
+                    anchor_features[blended_mask] = F.normalize(blended, p=2, dim=-1)
+                    anchor_confidence[blended_mask] = torch.maximum(
+                        anchor_confidence[blended_mask],
+                        anchor_cluster_confidence[blended_mask],
+                    )
+                print(
+                    f"[INFO] ClusterAttach blended {int(blended_mask.sum().item())}/{num_anchors} anchors "
+                    f"with cluster features."
+                )
+
+        raw_anchor_features = anchor_features.detach().clone()
         
         print(f"[INFO] 3D Feature lifting done. Original shape: {anchor_features.shape}")
 
