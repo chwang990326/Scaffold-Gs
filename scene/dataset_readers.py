@@ -125,8 +125,11 @@ def fetchPly(path):
     try:
         colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
     except:
-        colors = np.random.rand(positions.shape[0], positions.shape[1])
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+        colors = np.random.rand(positions.shape[0], 3)
+    try:
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    except:
+        normals = np.zeros_like(positions)
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):
@@ -206,8 +209,34 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
                            ply_path=ply_path)
     return scene_info
 
+def _resolve_transform_image_path(path, file_path, extension=".png"):
+    root, ext = os.path.splitext(file_path)
+    candidates = []
+    if ext:
+        candidates.append(file_path)
+    else:
+        candidates.extend([
+            file_path + extension,
+            file_path,
+            file_path + ".png",
+            file_path + ".jpg",
+            file_path + ".jpeg",
+            file_path + ".JPG",
+            file_path + ".JPEG",
+        ])
+
+    for candidate in candidates:
+        full_path = candidate if os.path.isabs(candidate) else os.path.join(path, candidate)
+        if os.path.exists(full_path):
+            return full_path
+    return None
+
+
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", is_debug=False, undistorted=False):
     cam_infos = []
+    skip_blender_axis_flip = _is_scannet_transform_scene(path)
+    if skip_blender_axis_flip:
+        print("Detected ScanNet-style transforms; using camera axes without Blender axis flip.")
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
         try:
@@ -216,9 +245,6 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             fovx = None
 
         frames = contents["frames"]
-        # check if filename already contain postfix
-        if frames[0]["file_path"].split('.')[-1] in ['jpg', 'jpeg', 'JPG', 'png']:
-            extension = ""
 
         c2ws = np.array([frame["transform_matrix"] for frame in frames])
         
@@ -229,9 +255,10 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         progress_bar = tqdm(frames, desc="Loading dataset")
 
         for idx, frame in enumerate(frames):
-            cam_name = os.path.join(path, frame["file_path"] + extension)
-            if not os.path.exists(cam_name):
+            image_path = _resolve_transform_image_path(path, frame["file_path"], extension)
+            if image_path is None:
                 continue
+            cam_name = image_path
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
             
@@ -242,8 +269,10 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 progress_bar.close()
             
             ct += 1
-            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
-            c2w[:3, 1:3] *= -1
+            # Blender/OpenGL transforms need a Y/Z flip. The ScanNet transforms used by
+            # InstanceGaussian are already in the expected convention.
+            if not skip_blender_axis_flip:
+                c2w[:3, 1:3] *= -1
             if "small_city_img" in path:
                 c2w[-1,-1] = 1
 
@@ -253,7 +282,6 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
             T = w2c[:3, 3]
 
-            image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
 
@@ -283,8 +311,10 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 FovX = fovx
             else:
                 # given focal in pixel unit
-                FovY = focal2fov(frame["fl_y"], image.size[1])
-                FovX = focal2fov(frame["fl_x"], image.size[0])
+                fl_y = frame.get("fl_y", contents.get("fl_y", contents.get("fl_x")))
+                fl_x = frame.get("fl_x", contents.get("fl_x", fl_y))
+                FovY = focal2fov(float(fl_y), image.size[1])
+                FovX = focal2fov(float(fl_x), image.size[0])
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
@@ -293,19 +323,50 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 break
     return cam_infos
 
+
+def _find_scannet_ply(path):
+    candidates = sorted(glob.glob(os.path.join(path, "*_vh_clean_2.ply")))
+    if candidates:
+        return candidates[0]
+    return None
+
+
+def _is_scannet_transform_scene(path):
+    return (
+        os.path.exists(os.path.join(path, "transforms_train.json"))
+        and os.path.isdir(os.path.join(path, "color"))
+        and _find_scannet_ply(path) is not None
+    )
+
+
 def readNerfSyntheticInfo(path, white_background, eval, extension=".png", ply_path=None):
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
-    print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
-    
-    if not eval:
+    test_transforms_path = os.path.join(path, "transforms_test.json")
+    if os.path.exists(test_transforms_path):
+        print("Reading Test Transforms")
+        test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
+    elif eval:
+        llffhold = 8
+        print(f"No transforms_test.json found; using idx % {llffhold} == 0 holdout split.")
+        all_train_cams = train_cam_infos
+        test_cam_infos = [c for idx, c in enumerate(all_train_cams) if idx % llffhold == 0]
+        train_cam_infos = [c for idx, c in enumerate(all_train_cams) if idx % llffhold != 0]
+    else:
+        test_cam_infos = []
+
+    if not eval and test_cam_infos:
         train_cam_infos.extend(test_cam_infos)
         test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
     if ply_path is None:
-        ply_path = os.path.join(path, "points3d.ply")
+        ply_candidates = [
+            os.path.join(path, "points3d.ply"),
+            os.path.join(path, "points3D.ply"),
+            _find_scannet_ply(path),
+        ]
+        ply_path = next((candidate for candidate in ply_candidates if candidate and os.path.exists(candidate)), os.path.join(path, "points3d.ply"))
     if not os.path.exists(ply_path):
         # Since this data set has no colmap data, we start with random points
         num_pts = 10_000

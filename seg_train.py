@@ -389,7 +389,7 @@ def log_effective_method_config(dataset, opt, triangle_branch_enabled, logger):
         return
     logger.info(
         "[METHOD] effective=%s profile=%s experts=%d auto_experts=%s expert_blend=%.3f "
-        "xyz_weight=%.3f boundary_weight=%.4f triangle_enabled=%s",
+        "xyz_weight=%.3f boundary_weight=%.4f triangle_enabled=%s feature_source=%s",
         get_effective_method_name(dataset, opt, triangle_branch_enabled),
         getattr(opt, "method_profile", "manual"),
         int(getattr(dataset, "semantic_num_experts", 1)),
@@ -398,6 +398,7 @@ def log_effective_method_config(dataset, opt, triangle_branch_enabled, logger):
         float(getattr(opt, "semantic_cluster_xyz_weight", 0.15)),
         float(getattr(opt, "boundary_loss_weight", 0.0)),
         triangle_branch_enabled,
+        getattr(opt, "semantic_feature_source", "sam_clip"),
     )
 
 
@@ -1105,6 +1106,8 @@ def initialize_semantic_routing(gaussians, dataset, opt, logger=None):
 
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sam_checkpoint, clip_model_path, wandb=None, logger=None, ply_path=None):
+    total_start_time = time.time()
+    semantic_lifting_seconds = 0.0
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     boundary_mask_dir = os.path.join(dataset.source_path, "stable_edge_masks")
@@ -1119,6 +1122,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     # ========================== [核心：语义提升逻辑 (已修改为支持断点加载)] ==========================
     # 定义保存路径
     sem_save_path = os.path.join(dataset.model_path, "anchor_semantic_features.pt")
+    sem_raw_save_path = os.path.join(dataset.model_path, "anchor_semantic_features_raw512.pt")
+    sem_anchor_save_path = os.path.join(dataset.model_path, "anchor_positions_for_semantic.pt")
     sem_conf_save_path = os.path.join(dataset.model_path, "anchor_semantic_confidence.pt")
     boundary_candidate_save_path = os.path.join(dataset.model_path, "boundary_candidates.pt")
     TARGET_SEMANTIC_DIM = 128
@@ -1172,15 +1177,21 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     needs_semantic_lifting = not os.path.exists(sem_save_path)
     needs_triangle_candidates = triangle_branch_enabled and not os.path.exists(boundary_candidate_save_path)
-    if boundary_candidates is None and sam_checkpoint and os.path.exists(sam_checkpoint) and (
+    semantic_feature_source = str(getattr(opt, "semantic_feature_source", "sam_clip")).strip().lower()
+    if semantic_feature_source in ("precomputed", "precomputed_language_features"):
+        semantic_feature_source = "language_features"
+    uses_precomputed_language_features = semantic_feature_source == "language_features"
+    semantic_source_available = uses_precomputed_language_features or (sam_checkpoint and os.path.exists(sam_checkpoint))
+    if boundary_candidates is None and semantic_source_available and (
         needs_semantic_lifting or needs_triangle_candidates
     ):
         if os.path.exists(sem_save_path):
             logger.info("[TRIANGLE] Semantic cache exists but boundary candidate cache is missing. Re-running semantic lifting for boundary candidates.")
         else:
-            logger.info("[SEMANTIC] No cache found. Starting 2D-3D semantic lifting.")
+            logger.info(f"[SEMANTIC] No cache found. Starting 2D-3D semantic lifting from {semantic_feature_source}.")
         real_anchors = gaussians.get_anchor.detach()
         logger.info(f"[SEMANTIC] Lifting semantics for {real_anchors.shape[0]} anchors.")
+        semantic_start_time = time.time()
         
         voter = SemanticVoter(
             dataset.source_path,
@@ -1202,8 +1213,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             boundary_candidate_confidence_threshold=getattr(opt, "triangle_confidence_threshold", 0.55),
             boundary_candidate_max_count=getattr(opt, "triangle_max_candidates", 1024),
             target_feature_dim=getattr(opt, "triangle_feature_dim", 128),
+            transform_holdout=8 if getattr(dataset, "eval", False) else 0,
+            semantic_feature_source=semantic_feature_source,
+            language_feature_level=getattr(opt, "semantic_language_feature_level", 3),
         )
         semantic_result = voter.run(real_anchors)
+        semantic_lifting_seconds = time.time() - semantic_start_time
         
         gaussians.semantic_features = semantic_result["features"].to("cuda")
         gaussians.semantic_confidence = semantic_result["confidence"].to("cuda")
@@ -1219,9 +1234,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         os.makedirs(dataset.model_path, exist_ok=True)
         torch.save(gaussians.semantic_features, sem_save_path)
         torch.save(gaussians.semantic_confidence, sem_conf_save_path)
+        if semantic_result.get("raw_features") is not None:
+            torch.save(semantic_result["raw_features"].detach().cpu(), sem_raw_save_path)
+            torch.save(real_anchors.detach().cpu(), sem_anchor_save_path)
         if triangle_branch_enabled and boundary_candidates is not None:
             torch.save(boundary_candidates, boundary_candidate_save_path)
         logger.info(f"[SEMANTIC] Saved semantic features to {sem_save_path}")
+        logger.info(f"[SEMANTIC] Semantic lifting time: {semantic_lifting_seconds / 60.0:.2f} min.")
         if triangle_branch_enabled and boundary_candidates is not None:
             logger.info(
                 f"[TRIANGLE] Saved {boundary_candidates['parent_anchor_indices'].shape[0]} boundary candidates to {boundary_candidate_save_path}"
@@ -1232,10 +1251,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         if 'real_anchors' in locals():
             del real_anchors
         torch.cuda.empty_cache()
-        logger.info("[SEMANTIC] Released SAM/CLIP memory and continued to training.")
+        logger.info("[SEMANTIC] Released semantic lifting memory and continued to training.")
 
     elif not os.path.exists(sem_save_path):
-        logger.info("[SEMANTIC] No SAM checkpoint and no cache found. Semantic initialization is skipped.")
+        logger.info("[SEMANTIC] No semantic source and no cache found. Semantic initialization is skipped.")
         gaussians.semantic_features = torch.zeros((gaussians.get_anchor.shape[0], TARGET_SEMANTIC_DIM), device="cuda")
         gaussians.semantic_confidence = torch.zeros((gaussians.get_anchor.shape[0],), device="cuda")
         gaussians.semantic_valid_mask = torch.zeros((gaussians.get_anchor.shape[0],), device="cuda", dtype=torch.bool)
@@ -1249,8 +1268,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     boundary_masks_ready = has_stable_edge_masks(boundary_mask_dir)
     if getattr(opt, "boundary_loss_weight", 0.0) > 0 and not boundary_masks_ready:
-        if sam_checkpoint and os.path.exists(sam_checkpoint):
-            logger.info("[BOUNDARY] No stable edge masks found. Exporting SAM-based boundary masks for sharpening supervision.")
+        if semantic_source_available:
+            logger.info(
+                f"[BOUNDARY] No stable edge masks found. Exporting boundary masks from {semantic_feature_source}."
+            )
             boundary_voter = SemanticVoter(
                 dataset.source_path,
                 sam_checkpoint,
@@ -1269,6 +1290,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 boundary_center_inner_ratio=getattr(opt, "boundary_center_inner_ratio", 0.25),
                 boundary_center_outer_ratio=getattr(opt, "boundary_center_outer_ratio", 0.15),
                 boundary_center_min_overlap_ratio=getattr(opt, "boundary_center_min_overlap_ratio", 0.30),
+                transform_holdout=8 if getattr(dataset, "eval", False) else 0,
+                semantic_feature_source=semantic_feature_source,
+                language_feature_level=getattr(opt, "semantic_language_feature_level", 3),
             )
             boundary_voter.export_stable_edge_masks()
             del boundary_voter
@@ -1331,6 +1355,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
+    train_start_time = time.time()
 
     viewpoint_stack = None
     training_cameras, transductive_test_view_names = build_transductive_training_cameras(scene, opt, dataset, logger)
@@ -1619,6 +1644,23 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         plt.savefig(plot_path)
         plt.close()
         if logger: logger.info(f"[PLOT] Training PSNR curve saved to {plot_path}")
+
+    train_seconds = time.time() - train_start_time
+    total_seconds = time.time() - total_start_time
+    timing_summary = {
+        "semantic_lifting_seconds": semantic_lifting_seconds,
+        "train_seconds": train_seconds,
+        "total_until_save_seconds": total_seconds,
+    }
+    with open(os.path.join(dataset.model_path, "time_summary.json"), "w") as f:
+        json.dump(timing_summary, f, indent=2)
+    if logger:
+        logger.info(
+            "[TIME] semantic_lifting=%.2f min, train=%.2f min, total_until_save=%.2f min",
+            semantic_lifting_seconds / 60.0,
+            train_seconds / 60.0,
+            total_seconds / 60.0,
+        )
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -1981,6 +2023,7 @@ def apply_method_profile(args, argv):
     )
 
 if __name__ == "__main__":
+    program_start_time = time.time()
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -2039,5 +2082,15 @@ if __name__ == "__main__":
     training(lp.extract(args), op.extract(args), pp.extract(args), args.source_path.split('/')[-1],  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sam_checkpoint, args.clip_model_path, wandb=None, logger=logger)
     
     # 后处理：渲染训练/测试集并评估
+    post_start_time = time.time()
     visible_count = render_sets(lp.extract(args), -1, pp.extract(args), op.extract(args), skip_train=False, logger=logger)
     evaluate(args.model_path, visible_count=visible_count, logger=logger)
+    total_seconds = time.time() - program_start_time
+    post_seconds = time.time() - post_start_time
+    summary_path = os.path.join(args.model_path, "end_to_end_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump({
+            "total_seconds": total_seconds,
+            "post_render_eval_seconds": post_seconds,
+        }, f, indent=2)
+    logger.info("[TIME] post_render_eval=%.2f min, end_to_end=%.2f min", post_seconds / 60.0, total_seconds / 60.0)

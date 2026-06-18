@@ -162,6 +162,8 @@ class OptimizationParams(ParamGroup):
         self.semantic_min_views = 2
         self.semantic_view_stride = 1
         self.semantic_view_offset = 0
+        self.semantic_feature_source = "sam_clip"
+        self.semantic_language_feature_level = 3
         self.semantic_boundary_kernel = 5
         self.semantic_min_interior_pixels = 32
         self.method_profile = "manual"

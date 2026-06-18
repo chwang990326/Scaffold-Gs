@@ -1,6 +1,8 @@
 import os
 import sys
 import struct
+import json
+import glob
 import numpy as np
 import torch
 import cv2
@@ -10,6 +12,7 @@ from safetensors.torch import load_file
 from transformers import SamModel, SamProcessor, CLIPModel, CLIPImageProcessor
 import torch.nn.functional as F
 from PIL import Image as PILImage
+from utils.graphics_utils import fov2focal
 
 # [新增] 导入 PCA
 from sklearn.decomposition import PCA
@@ -274,6 +277,27 @@ def get_intrinsic_matrix(camera):
     elif camera.model == 1: K[0, 0] = params[0]; K[1, 1] = params[1]; K[0, 2] = params[2]; K[1, 2] = params[3]
     return torch.tensor(K, dtype=torch.float32)
 
+
+class TransformCamera:
+    def __init__(self, width, height, fl_x, fl_y, cx, cy):
+        self.width = width
+        self.height = height
+        self.model = 1
+        self.params = np.array([fl_x, fl_y, cx, cy], dtype=np.float32)
+
+
+class TransformImage:
+    def __init__(self, name, camera_id, transform_matrix, apply_blender_axis_flip=True):
+        self.name = name
+        self.camera_id = camera_id
+        c2w = np.array(transform_matrix, dtype=np.float32)
+        if apply_blender_axis_flip:
+            c2w[:3, 1:3] *= -1
+        w2c = np.linalg.inv(c2w)
+        self.qvec = None
+        self.tvec = w2c[:3, 3].astype(np.float32)
+        self.rmat = w2c[:3, :3].astype(np.float32)
+
 class SemanticVoter:
     def __init__(
         self,
@@ -297,15 +321,35 @@ class SemanticVoter:
         target_feature_dim=128,
         view_stride=1,
         view_offset=0,
+        transform_holdout=0,
+        semantic_feature_source="sam_clip",
+        language_feature_level=3,
     ):
         self.device = device
         self.scene_path = scene_path
-        self.segmentor = SAMCLIPSegmentor(
-            sam_model_path,
-            clip_model_name=clip_model_name,
-            device=device,
-            enable_clip=enable_clip,
-        )
+        self.semantic_feature_source = str(semantic_feature_source).strip().lower()
+        if self.semantic_feature_source in ("precomputed", "precomputed_language_features"):
+            self.semantic_feature_source = "language_features"
+        if self.semantic_feature_source not in ("sam_clip", "language_features"):
+            raise ValueError(
+                f"Unknown semantic_feature_source={semantic_feature_source}. "
+                "Choose 'sam_clip' or 'language_features'."
+            )
+        self.language_feature_level = max(0, int(language_feature_level))
+        self.use_precomputed_language_features = self.semantic_feature_source == "language_features"
+        self.segmentor = None
+        if self.use_precomputed_language_features:
+            print(
+                "[INFO] Using precomputed language_features/*_s.npy and *_f.npy "
+                f"(level={self.language_feature_level}) for semantic lifting."
+            )
+        else:
+            self.segmentor = SAMCLIPSegmentor(
+                sam_model_path,
+                clip_model_name=clip_model_name,
+                device=device,
+                enable_clip=enable_clip,
+            )
         self.boundary_kernel = max(1, int(boundary_kernel))
         self.min_interior_area = max(1, int(min_interior_area))
         self.min_views = max(1, int(min_views))
@@ -321,6 +365,7 @@ class SemanticVoter:
         self.target_feature_dim = max(1, int(target_feature_dim))
         self.view_stride = max(1, int(view_stride))
         self.view_offset = max(0, int(view_offset))
+        self.transform_holdout = max(0, int(transform_holdout))
         
         # [???] ?????? 2D ?????????????????
         self.mask_out_dir = os.path.join(scene_path, "semantic_masks_2d")
@@ -332,9 +377,14 @@ class SemanticVoter:
         
         sparse_dir = os.path.join(scene_path, "sparse", "0")
         if not os.path.exists(sparse_dir): sparse_dir = os.path.join(scene_path, "sparse")
-             
-        self.cameras = read_cameras_binary(os.path.join(sparse_dir, "cameras.bin"))
-        self.images = read_images_binary(os.path.join(sparse_dir, "images.bin"))
+
+        cameras_bin = os.path.join(sparse_dir, "cameras.bin")
+        images_bin = os.path.join(sparse_dir, "images.bin")
+        if os.path.exists(cameras_bin) and os.path.exists(images_bin):
+            self.cameras = read_cameras_binary(cameras_bin)
+            self.images = read_images_binary(images_bin)
+        else:
+            self.cameras, self.images = self._read_transform_cameras()
         self.sorted_image_keys = sorted(self.images.keys(), key=lambda x: self.images[x].name)
         self.selected_image_keys = self.sorted_image_keys[self.view_offset::self.view_stride]
         if len(self.selected_image_keys) == 0 and len(self.sorted_image_keys) > 0:
@@ -344,13 +394,66 @@ class SemanticVoter:
             f"(stride={self.view_stride}, offset={self.view_offset})"
         )
 
+    def _read_transform_cameras(self):
+        transforms_path = os.path.join(self.scene_path, "transforms_train.json")
+        if not os.path.exists(transforms_path):
+            raise FileNotFoundError(
+                f"Neither COLMAP sparse binaries nor transforms_train.json exist under {self.scene_path}"
+            )
+
+        with open(transforms_path, "r") as f:
+            contents = json.load(f)
+
+        width = int(contents["w"])
+        height = int(contents["h"])
+        if "fl_x" in contents:
+            fl_x = float(contents["fl_x"])
+        else:
+            fl_x = float(fov2focal(float(contents["camera_angle_x"]), width))
+        fl_y = float(contents.get("fl_y", fl_x))
+        cx = float(contents.get("cx", width / 2.0))
+        cy = float(contents.get("cy", height / 2.0))
+
+        camera = TransformCamera(width, height, fl_x, fl_y, cx, cy)
+        images = {}
+        apply_blender_axis_flip = not self._is_scannet_transform_scene()
+        if not apply_blender_axis_flip:
+            print("[INFO] Detected ScanNet-style transforms; disabling Blender axis flip for semantic lifting.")
+        for idx, frame in enumerate(contents["frames"]):
+            if self.transform_holdout > 0 and idx % self.transform_holdout == 0:
+                continue
+            images[idx + 1] = TransformImage(
+                frame["file_path"],
+                1,
+                frame["transform_matrix"],
+                apply_blender_axis_flip=apply_blender_axis_flip,
+            )
+        print(f"[INFO] Loaded {len(images)} transform cameras for semantic lifting.")
+        return {1: camera}, images
+
+    def _is_scannet_transform_scene(self):
+        return (
+            os.path.exists(os.path.join(self.scene_path, "transforms_train.json"))
+            and os.path.isdir(os.path.join(self.scene_path, "color"))
+            and len(glob.glob(os.path.join(self.scene_path, "*_vh_clean_2.ply"))) > 0
+        )
+
     def _resolve_image_path(self, image_name):
-        full_img_path = os.path.join(self.scene_path, "images_4", image_name)
-        if not os.path.exists(full_img_path):
-            full_img_path = os.path.join(self.scene_path, "images", image_name)
-        if not os.path.exists(full_img_path):
-            return None
-        return full_img_path
+        candidates = []
+        root, ext = os.path.splitext(image_name)
+        if ext:
+            candidates.append(os.path.join(self.scene_path, image_name))
+            candidates.append(os.path.join(self.scene_path, "images_4", os.path.basename(image_name)))
+            candidates.append(os.path.join(self.scene_path, "images", os.path.basename(image_name)))
+        else:
+            for folder in ["images_4", "images", "color", ""]:
+                base = os.path.join(self.scene_path, folder, image_name) if folder else os.path.join(self.scene_path, image_name)
+                candidates.extend([base, base + ".png", base + ".jpg", base + ".jpeg", base + ".JPG", base + ".JPEG"])
+
+        for full_img_path in candidates:
+            if os.path.exists(full_img_path):
+                return full_img_path
+        return None
 
     def _save_semantic_visualization(self, id_map, image_name):
         h, w = id_map.shape
@@ -460,17 +563,113 @@ class SemanticVoter:
         y_weights = axis_weights(y_coords)
         return torch.from_numpy(y_weights[:, None] * x_weights[None, :]).to(self.device)
 
+    def _resolve_language_feature_paths(self, image_name):
+        image_stem = os.path.splitext(os.path.basename(image_name))[0]
+        feature_dir = os.path.join(self.scene_path, "language_features")
+        return (
+            os.path.join(feature_dir, f"{image_stem}_s.npy"),
+            os.path.join(feature_dir, f"{image_stem}_f.npy"),
+        )
+
+    def _process_precomputed_language_features(self, image_name, compute_clip_features=True):
+        mask_path, feature_path = self._resolve_language_feature_paths(image_name)
+        if not os.path.exists(mask_path):
+            return None
+        if compute_clip_features and not os.path.exists(feature_path):
+            return None
+
+        language_masks = np.load(mask_path)
+        if language_masks.ndim == 2:
+            language_masks = language_masks[None, ...]
+        level = min(self.language_feature_level, language_masks.shape[0] - 1)
+        raw_mask_ids = np.asarray(language_masks[level], dtype=np.int64)
+        height, width = raw_mask_ids.shape
+
+        if level > 0:
+            previous_max_id = int(np.nanmax(language_masks[level - 1]))
+            min_abs_id = max(0, previous_max_id + 1)
+        else:
+            min_abs_id = 0
+
+        feature_array = None
+        if compute_clip_features:
+            feature_array = np.load(feature_path).astype(np.float32)
+            max_abs_id = min(int(np.nanmax(raw_mask_ids)) + 1, feature_array.shape[0])
+        else:
+            max_abs_id = int(np.nanmax(raw_mask_ids)) + 1
+
+        valid_mask = (raw_mask_ids >= min_abs_id) & (raw_mask_ids < max_abs_id)
+        local_id_map = np.zeros_like(raw_mask_ids, dtype=np.int32)
+        local_id_map[valid_mask] = raw_mask_ids[valid_mask] - min_abs_id + 1
+
+        id_map = torch.from_numpy(local_id_map).to(self.device, dtype=torch.int32)
+        interior_id_map = torch.zeros_like(id_map)
+        id_to_feat = {}
+        id_to_score = {}
+        mask_infos = {}
+        kernel = None
+        if self.boundary_kernel > 1:
+            kernel = np.ones((self.boundary_kernel, self.boundary_kernel), dtype=np.uint8)
+
+        unique_ids = np.unique(local_id_map)
+        unique_ids = unique_ids[unique_ids > 0]
+        for local_id in unique_ids:
+            local_id = int(local_id)
+            mask = (local_id_map == local_id).astype(np.uint8)
+            if int(mask.sum()) == 0:
+                continue
+
+            if kernel is not None:
+                eroded_mask = cv2.erode(mask, kernel, iterations=1)
+                if int(eroded_mask.sum()) >= int(self.min_interior_area):
+                    interior_mask = eroded_mask
+                else:
+                    interior_mask = np.zeros_like(mask)
+            else:
+                interior_mask = mask
+
+            if interior_mask.any():
+                interior_id_map[torch.from_numpy(interior_mask.astype(bool)).to(self.device)] = local_id
+
+            id_to_score[local_id] = 1.0
+            mask_infos[local_id] = {
+                "mask": mask.copy(),
+                "score": 1.0,
+            }
+
+            if not compute_clip_features:
+                continue
+
+            abs_id = min_abs_id + local_id - 1
+            if abs_id < 0 or abs_id >= feature_array.shape[0]:
+                continue
+            feat = torch.from_numpy(feature_array[abs_id]).to(self.device, dtype=torch.float32)
+            if feat.abs().sum() <= 0:
+                continue
+            id_to_feat[local_id] = F.normalize(feat, p=2, dim=0)
+
+        return id_map, interior_id_map, id_to_feat, id_to_score, mask_infos
+
     def _process_view(self, colmap_img, compute_clip_features=True):
         full_img_path = self._resolve_image_path(colmap_img.name)
         if full_img_path is None:
             return None
 
-        id_map, interior_id_map, id_to_feat, id_to_score, mask_infos = self.segmentor.process_image(
-            full_img_path,
-            boundary_kernel=self.boundary_kernel,
-            min_interior_area=self.min_interior_area,
-            compute_clip_features=compute_clip_features,
-        )
+        if self.use_precomputed_language_features:
+            processed = self._process_precomputed_language_features(
+                colmap_img.name,
+                compute_clip_features=compute_clip_features,
+            )
+            if processed is None:
+                return None
+            id_map, interior_id_map, id_to_feat, id_to_score, mask_infos = processed
+        else:
+            id_map, interior_id_map, id_to_feat, id_to_score, mask_infos = self.segmentor.process_image(
+                full_img_path,
+                boundary_kernel=self.boundary_kernel,
+                min_interior_area=self.min_interior_area,
+                compute_clip_features=compute_clip_features,
+            )
         h, w = id_map.shape
         self._save_semantic_visualization(id_map, colmap_img.name)
         stable_edge_mask = self._build_stable_edge_mask(mask_infos, h, w)
@@ -523,7 +722,11 @@ class SemanticVoter:
                 K[0, 2] *= scale_x
                 K[1, 2] *= scale_y
 
-            R = torch.tensor(qvec2rotmat(colmap_img.qvec), dtype=torch.float32, device=self.device)
+            if getattr(colmap_img, "qvec", None) is not None:
+                rmat = qvec2rotmat(colmap_img.qvec)
+            else:
+                rmat = colmap_img.rmat
+            R = torch.tensor(rmat, dtype=torch.float32, device=self.device)
             T = torch.tensor(colmap_img.tvec, dtype=torch.float32, device=self.device)
             
             pts_cam = (anchors @ R.t()) + T
@@ -575,6 +778,7 @@ class SemanticVoter:
         mask = anchor_score_sums > 0
         anchor_features[mask] /= anchor_score_sums[mask].unsqueeze(1)
         anchor_features[mask] = F.normalize(anchor_features[mask], p=2, dim=-1)
+        raw_anchor_features = anchor_features.detach().clone()
         boundary_mask = boundary_score_sums > 0
         boundary_features[boundary_mask] /= boundary_score_sums[boundary_mask].unsqueeze(1)
         boundary_features[boundary_mask] = F.normalize(boundary_features[boundary_mask], p=2, dim=-1)
@@ -669,6 +873,7 @@ class SemanticVoter:
 
         return {
             "features": anchor_features,
+            "raw_features": raw_anchor_features,
             "confidence": anchor_confidence,
             "valid_mask": mask,
             "boundary_candidates": boundary_candidates,
