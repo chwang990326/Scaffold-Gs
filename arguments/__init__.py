@@ -195,7 +195,7 @@ class OptimizationParams(ParamGroup):
         self.semantic_auto_force_small_merge = False
         self.transductive_train_test_views = True
         self.transductive_test_view_count = 0
-        self.transductive_test_view_ratio = 0.05
+        self.transductive_test_view_ratio = 0.08
         self.transductive_test_view_seed = 42
         self.semantic_missing_policy = "shared_fallback"
         self.semantic_expert_blend = 0.25

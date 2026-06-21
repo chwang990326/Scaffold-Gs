@@ -50,6 +50,14 @@ from semantic_init_main import SemanticVoter
 
 REDACTED_ARG_PREFIXES = ("transductive_",)
 
+# Keep experiment outputs lean by default. These files are useful for debugging,
+# but they are not required for final PSNR/SSIM/LPIPS/FPS reporting.
+SAVE_SEMANTIC_CACHE_OUTPUTS = False
+SAVE_SEMANTIC_VIS_OUTPUTS = False
+SAVE_EVAL_GT_AND_ERROR_IMAGES = False
+SAVE_EVAL_EASY_ACCESS_IMAGES = False
+SAVE_PLOT_IMAGES = False
+
 
 def args_for_log(args):
     return Namespace(**{
@@ -1276,14 +1284,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             boundary_candidates = None
 
         os.makedirs(dataset.model_path, exist_ok=True)
-        torch.save(gaussians.semantic_features, sem_save_path)
-        torch.save(gaussians.semantic_confidence, sem_conf_save_path)
-        if semantic_result.get("raw_features") is not None:
-            torch.save(semantic_result["raw_features"].detach().cpu(), sem_raw_save_path)
-            torch.save(real_anchors.detach().cpu(), sem_anchor_save_path)
+        if SAVE_SEMANTIC_CACHE_OUTPUTS:
+            torch.save(gaussians.semantic_features, sem_save_path)
+            torch.save(gaussians.semantic_confidence, sem_conf_save_path)
+            if semantic_result.get("raw_features") is not None:
+                torch.save(semantic_result["raw_features"].detach().cpu(), sem_raw_save_path)
+                torch.save(real_anchors.detach().cpu(), sem_anchor_save_path)
         if triangle_branch_enabled and boundary_candidates is not None:
             torch.save(boundary_candidates, boundary_candidate_save_path)
-        logger.info(f"[SEMANTIC] Saved semantic features to {sem_save_path}")
+        if SAVE_SEMANTIC_CACHE_OUTPUTS:
+            logger.info(f"[SEMANTIC] Saved semantic features to {sem_save_path}")
+        else:
+            logger.info("[SEMANTIC] Semantic cache export disabled; features are kept in memory for this run.")
         logger.info(f"[SEMANTIC] Semantic lifting time: {semantic_lifting_seconds / 60.0:.2f} min.")
         if triangle_branch_enabled and boundary_candidates is not None:
             logger.info(
@@ -1355,7 +1367,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             logger.warning("[BOUNDARY] Stable edge masks are missing and SAM checkpoint is unavailable. Boundary sharpening supervision will be skipped.")
 
     # [新增] 在获取完语义特征后，立刻执行 PCA 降维并导出可供外部软件查看的点云文件
-    if gaussians.semantic_features.shape[0] > 0 and gaussians.semantic_features.shape[1] >= 3:
+    if SAVE_SEMANTIC_VIS_OUTPUTS and gaussians.semantic_features.shape[0] > 0 and gaussians.semantic_features.shape[1] >= 3:
         sem_ply_path = os.path.join(dataset.model_path, "anchor_semantic_pca_vis.ply")
         logger.info("\n[SEMANTIC] 正在提取并生成语义特征的 PCA 降维 3D 可视化点云...")
         export_semantic_point_cloud(gaussians.get_anchor, gaussians.semantic_features, sem_ply_path, logger)
@@ -1686,7 +1698,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-    if MATPLOTLIB_FOUND and len(iter_history) > 0:
+    if SAVE_PLOT_IMAGES and MATPLOTLIB_FOUND and len(iter_history) > 0:
         plt.figure(figsize=(10, 5))
         plt.plot(iter_history, psnr_history, marker='o', linestyle='-', color='r')
         plt.title('Test PSNR over Training Iterations')
@@ -1790,13 +1802,58 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
         torch.cuda.empty_cache()
         scene.gaussians.train()
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, opt):
+def write_precomputed_eval_metrics(model_path, method, metric_summary, logger=None):
+    if metric_summary is None:
+        return
+    full_dict = {
+        method: {
+            "SSIM": metric_summary["SSIM"],
+            "PSNR": metric_summary["PSNR"],
+            "LPIPS": metric_summary["LPIPS"],
+        }
+    }
+    per_view_dict = {
+        method: {
+            "SSIM": metric_summary["per_view"]["SSIM"],
+            "PSNR": metric_summary["per_view"]["PSNR"],
+        }
+    }
+    with open(os.path.join(model_path, "results.json"), "w") as fp:
+        json.dump(full_dict, fp, indent=True)
+    with open(os.path.join(model_path, "per_view.json"), "w") as fp:
+        json.dump(per_view_dict, fp, indent=True)
+    if logger:
+        logger.info(
+            "[EVAL] %s: SSIM %.5f PSNR %.5f LPIPS %.5f",
+            method,
+            metric_summary["SSIM"],
+            metric_summary["PSNR"],
+            metric_summary["LPIPS"],
+        )
+        logger.info("Evaluation complete.")
+
+
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, opt, compute_metrics=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    makedirs(render_path, exist_ok=True); makedirs(error_path, exist_ok=True); makedirs(gts_path, exist_ok=True)
-    
+    makedirs(render_path, exist_ok=True)
+    if SAVE_EVAL_GT_AND_ERROR_IMAGES:
+        makedirs(error_path, exist_ok=True)
+        makedirs(gts_path, exist_ok=True)
+
     t_list, visible_count_list, per_view_dict = [], [], {}
+    metric_state = None
+    lpips_fn = None
+    if compute_metrics:
+        lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
+        metric_state = {
+            "SSIM": [],
+            "PSNR": [],
+            "LPIPS": [],
+            "per_view": {"SSIM": {}, "PSNR": {}},
+        }
+
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         torch.cuda.synchronize(); t_start = time.time()
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
@@ -1807,17 +1864,40 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         visible_count = (render_pkg["radii"] > 0).sum()
         visible_count_list.append(visible_count)
-        gt = view.original_image[0:3, :, :]
-        errormap = (rendering - gt).abs()
+        gt = torch.clamp(view.original_image[0:3, :, :].to(rendering.device), 0.0, 1.0)
+        image_name = '{0:05d}'.format(idx) + ".png"
 
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
-        per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
-    
+        torchvision.utils.save_image(rendering, os.path.join(render_path, image_name))
+        if SAVE_EVAL_GT_AND_ERROR_IMAGES:
+            errormap = (rendering - gt).abs()
+            torchvision.utils.save_image(errormap, os.path.join(error_path, image_name))
+            torchvision.utils.save_image(gt, os.path.join(gts_path, image_name))
+        if metric_state is not None:
+            metric_rendering = torch.round(rendering * 255.0) / 255.0
+            metric_gt = torch.round(gt * 255.0) / 255.0
+            render_batch = metric_rendering.unsqueeze(0)
+            gt_batch = metric_gt.unsqueeze(0)
+            ssim_value = ssim(render_batch, gt_batch).detach().mean()
+            psnr_value = psnr(render_batch, gt_batch).detach().mean()
+            lpips_value = lpips_fn(render_batch, gt_batch).detach().mean()
+            metric_state["SSIM"].append(ssim_value)
+            metric_state["PSNR"].append(psnr_value)
+            metric_state["LPIPS"].append(lpips_value)
+            metric_state["per_view"]["SSIM"][image_name] = ssim_value.item()
+            metric_state["per_view"]["PSNR"][image_name] = psnr_value.item()
+        per_view_dict[image_name] = visible_count.item()
+
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)
-    return t_list, visible_count_list
+    metric_summary = None
+    if metric_state is not None and len(metric_state["SSIM"]) > 0:
+        metric_summary = {
+            "SSIM": torch.stack(metric_state["SSIM"]).mean().item(),
+            "PSNR": torch.stack(metric_state["PSNR"]).mean().item(),
+            "LPIPS": torch.stack(metric_state["LPIPS"]).mean().item(),
+            "per_view": metric_state["per_view"],
+        }
+    return t_list, visible_count_list, metric_summary
 
 
 def log_fps_stats(name, timings, logger):
@@ -1848,13 +1928,24 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             opt = Namespace()
         
         if not skip_train:
-            t_train_list, _ = render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, opt)
+            t_train_list, _, _ = render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, opt)
             log_fps_stats("Train", t_train_list, logger)
 
         visible_count = 0
         if not skip_test:
-            t_test_list, visible_count = render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, opt)
+            t_test_list, visible_count, metric_summary = render_set(
+                dataset.model_path,
+                "test",
+                scene.loaded_iter,
+                scene.getTestCameras(),
+                gaussians,
+                pipeline,
+                background,
+                opt,
+                compute_metrics=True,
+            )
             log_fps_stats("Test", t_test_list, logger)
+            write_precomputed_eval_metrics(dataset.model_path, f"ours_{scene.loaded_iter}", metric_summary, logger)
     return visible_count
 
 def readImages(renders_dir, gt_dir):
@@ -1870,9 +1961,6 @@ def readImages(renders_dir, gt_dir):
     return renders, gts, image_names
 
 def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, dataset_name=None, logger=None):
-    # [修改 2] 在真正需要的时候才初始化 LPIPS，避免 GPU 冲突
-    lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
-    
     # [保留] 原始 train.py 的全量字典结构评估逻辑
     full_dict, per_view_dict = {}, {}
     scene_dir = model_paths
@@ -1894,9 +1982,14 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
             json.dump(full_dict[scene_dir], fp, indent=True)
         return
 
+    lpips_fn = None
     for method in method_names:
         full_dict[scene_dir][method], per_view_dict[scene_dir][method] = {}, {}
         method_dir = test_dir / method
+        if not (method_dir / "gt").exists() and (Path(scene_dir) / "results.json").exists():
+            if logger:
+                logger.info("[EVAL] Disk GT images are disabled; using metrics computed during rendering.")
+            return
         renders, gts, image_names = readImages(method_dir / "renders", method_dir / "gt")
         if len(image_names) == 0:
             if logger:
@@ -1905,6 +1998,9 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
             per_view_dict[scene_dir][method].update({"SSIM": {}, "PSNR": {}})
             continue
         ssims, psnrs, lpipss = [], [], []
+        if lpips_fn is None:
+            # [修改 2] 在真正需要的时候才初始化 LPIPS，避免 GPU 冲突
+            lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
 
         for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
             ssims.append(ssim(renders[idx], gts[idx]))
@@ -1917,7 +2013,7 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
         # ==========================================================
         # [新增模块]：生成可视化曲线图并直接拷贝测试图片出来
         # ==========================================================
-        if MATPLOTLIB_FOUND and len(psnrs) > 0:
+        if SAVE_PLOT_IMAGES and MATPLOTLIB_FOUND and len(psnrs) > 0:
             psnr_list = [p.item() for p in psnrs]
             plt.figure(figsize=(12, 5))
             plt.plot(range(len(psnr_list)), psnr_list, marker='.', linestyle='-', color='b')
@@ -1937,16 +2033,17 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
             if logger: logger.info(f"[PLOT] Per-view PSNR curve saved to {plot_path}")
 
         # 将生成的测试渲染图提取并拷贝到最外层目录，方便使用者查看
-        easy_access_dir = Path(scene_dir) / f"test_renders_easy_access_{method}"
-        os.makedirs(easy_access_dir, exist_ok=True)
-        
-        for fname in image_names:
-            src_file = method_dir / "renders" / fname
-            dst_file = easy_access_dir / fname
-            if src_file.exists():
-                shutil.copy(src_file, dst_file)
-        
-        if logger: logger.info(f"[EXPORT] All test render images have been copied to: {easy_access_dir}")
+        if SAVE_EVAL_EASY_ACCESS_IMAGES:
+            easy_access_dir = Path(scene_dir) / f"test_renders_easy_access_{method}"
+            os.makedirs(easy_access_dir, exist_ok=True)
+
+            for fname in image_names:
+                src_file = method_dir / "renders" / fname
+                dst_file = easy_access_dir / fname
+                if src_file.exists():
+                    shutil.copy(src_file, dst_file)
+
+            if logger: logger.info(f"[EXPORT] All test render images have been copied to: {easy_access_dir}")
         # ==========================================================
 
     with open(scene_dir + "/results.json", 'w') as fp:
